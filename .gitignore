@@ -7,6 +7,7 @@ dist/
 build/
 .venv/
 .env
+batch_generate_text_and_clone/text_generation/.env
 .DS_Store
 .pytest_cache/
 .mypy_cache/
@@ -19,12 +20,26 @@ build/
 /data/
 /download
 /local/
-/run*
 example.py
 results/
 examples/data*
 examples/download*
 examples/exp*
 .claude/
+
+# Generated outputs and large artifacts
 *.wav
 *.jsonl
+/voice_clone_results*/
+/batch_generate/inputs/
+/batch_generate/eval_results/
+/batch_generate/outputs/
+/batch_generate/*.log
+/batch_generate/*.out
+/batch_generate/gpu*.log
+/batch_generate/v3_gpu*.log
+/TTS_eval_models/**/*.pth
+/TTS_eval_models/**/*.pt
+/TTS_eval_models/wer/
+batch_generated_text
+batch_cloned_voices

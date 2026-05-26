@@ -21,7 +21,7 @@ Shared utilities for WER evaluation scripts.
 import logging
 
 import numpy as np
-from jiwer import compute_measures
+from jiwer import process_words
 
 
 def process_one(hypothesis: str, truth: str, post_process, lang: str = None) -> dict:
@@ -52,15 +52,15 @@ def process_one(hypothesis: str, truth: str, post_process, lang: str = None) -> 
     else:
         truth_processed = post_process(truth)
         hypothesis_processed = post_process(hypothesis)
-    measures = compute_measures(truth_processed, hypothesis_processed)
+    measures = process_words(truth_processed, hypothesis_processed)
     word_num = len(truth_processed.split(" "))
     return {
         "truth": truth_processed,
         "hypo": hypothesis_processed,
-        "wer": measures["wer"],
-        "substitutions": measures["substitutions"],
-        "deletions": measures["deletions"],
-        "insertions": measures["insertions"],
+        "wer": measures.wer,
+        "substitutions": measures.substitutions,
+        "deletions": measures.deletions,
+        "insertions": measures.insertions,
         "word_num": word_num,
     }
 
