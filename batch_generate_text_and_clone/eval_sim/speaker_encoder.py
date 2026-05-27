@@ -94,6 +94,49 @@ class SpeakerEncoder:
         pcm, sample_rate = torchaudio.load(str(audio_path), normalize=False)
         return self.extract_embedding_from_pcm(pcm, sample_rate)
 
+    def extract_embeddings_batch(
+        self, audio_paths: list[Union[str, Path]]
+    ) -> dict[str, Optional[torch.Tensor]]:
+        """Batch GPU forward for multiple files (pad fbank to max frame)."""
+        if not audio_paths:
+            return {}
+        paths = [str(p) for p in audio_paths]
+        feats_list: list[torch.Tensor] = []
+        valid_paths: list[str] = []
+        out: dict[str, Optional[torch.Tensor]] = {p: None for p in paths}
+
+        for p in paths:
+            try:
+                pcm, sample_rate = torchaudio.load(p, normalize=False)
+                pcm = pcm.to(torch.float)
+                if sample_rate != self.resample_rate:
+                    pcm = torchaudio.transforms.Resample(
+                        orig_freq=sample_rate, new_freq=self.resample_rate
+                    )(pcm)
+                feat = self.compute_fbank(pcm, sample_rate=self.resample_rate, cmn=True)
+                feats_list.append(feat)
+                valid_paths.append(p)
+            except Exception:
+                continue
+
+        if not feats_list:
+            return out
+
+        max_t = max(f.shape[0] for f in feats_list)
+        batch = torch.zeros(len(feats_list), max_t, feats_list[0].shape[1])
+        for i, feat in enumerate(feats_list):
+            batch[i, : feat.shape[0]] = feat
+
+        batch = batch.to(self.device)
+        with torch.no_grad():
+            outputs = self.model(batch)
+            outputs = outputs[-1] if isinstance(outputs, tuple) else outputs
+            embs = outputs.cpu()
+
+        for i, p in enumerate(valid_paths):
+            out[p] = embs[i]
+        return out
+
     @staticmethod
     def cosine_similarity(e1, e2) -> float:
         if isinstance(e1, torch.Tensor):

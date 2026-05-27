@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Embedding cache and similarity helpers for eval_sim."""
+"""Speaker similarity helpers for eval_sim."""
 
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Optional
 
 import numpy as np
 import torch
@@ -36,51 +35,11 @@ def cosine_similarity(e1, e2) -> float:
     return SpeakerEncoder.cosine_similarity(e1, e2)
 
 
-class EmbeddingCache:
-    """Disk-backed cache: audio_path -> embedding ndarray."""
-
-    def __init__(self, cache_dir: Path):
-        self.cache_dir = cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._mem: Dict[str, np.ndarray] = {}
-
-    def _key_path(self, audio_path: str) -> Path:
-        safe = audio_path.replace("/", "__")
-        return self.cache_dir / f"{safe}.pkl"
-
-    def get(self, audio_path: str) -> Optional[np.ndarray]:
-        if audio_path in self._mem:
-            return self._mem[audio_path]
-        p = self._key_path(audio_path)
-        if p.exists():
-            with open(p, "rb") as f:
-                data = pickle.load(f)
-            emb = data.get("embedding")
-            if emb is not None:
-                emb = embedding_to_numpy(emb)
-                self._mem[audio_path] = emb
-                return emb
+def compute_similarity(
+    encoder: SpeakerEncoder, path1: str, path2: str
+) -> Optional[float]:
+    e1 = encoder.extract_embedding(path1)
+    e2 = encoder.extract_embedding(path2)
+    if e1 is None or e2 is None:
         return None
-
-    def put(self, audio_path: str, embedding) -> np.ndarray:
-        emb = embedding_to_numpy(embedding)
-        self._mem[audio_path] = emb
-        with open(self._key_path(audio_path), "wb") as f:
-            pickle.dump({"audio_path": audio_path, "embedding": emb}, f)
-        return emb
-
-    def get_or_extract(self, encoder: SpeakerEncoder, audio_path: str) -> Optional[np.ndarray]:
-        cached = self.get(audio_path)
-        if cached is not None:
-            return cached
-        emb = encoder.extract_embedding(audio_path)
-        if emb is None:
-            return None
-        return self.put(audio_path, emb)
-
-    def similarity(self, encoder: SpeakerEncoder, path1: str, path2: str) -> Optional[float]:
-        e1 = self.get_or_extract(encoder, path1)
-        e2 = self.get_or_extract(encoder, path2)
-        if e1 is None or e2 is None:
-            return None
-        return cosine_similarity(e1, e2)
+    return cosine_similarity(e1, e2)

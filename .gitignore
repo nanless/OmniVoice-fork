@@ -43,3 +43,5 @@ examples/exp*
 /TTS_eval_models/wer/
 batch_generated_text
 batch_cloned_voices
+*.log
+*.json

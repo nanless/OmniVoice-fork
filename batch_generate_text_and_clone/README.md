@@ -119,6 +119,16 @@ bash run_eval.sh
 
 → 详见 [eval_mos/README.md](eval_mos/README.md)
 
+### 全库三类评测（CER → SIM → MOS，tmux 后台）
+
+```bash
+bash batch_generate_text_and_clone/run_eval_all.sh   # 自动创建 tmux session eval_all
+tmux attach -t eval_all                              # 查看进度
+tail -f batch_cloned_voices/logs/eval_all/cer.log     # 或单独看某阶段日志
+```
+
+顺序：**CER → SIM → MOS**；`--skip-existing` 断点续跑；日志实时写入 `logs/eval_all/`。
+
 ## 选用哪个脚本？
 
 ### 克隆

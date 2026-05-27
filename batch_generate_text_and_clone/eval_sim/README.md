@@ -111,8 +111,6 @@ similarity = (cosine + 1) / 2
 | `--gpu` | 0 | CUDA 设备 |
 | `--sample-size` | 全量 | 随机子集大小 |
 | `--seed` | 42 | 抽样 seed |
-| `--cache-dir` | `<out-dir>/eval_sim_embedding_cache` | embedding 缓存 |
-| `--skip-cache` | off | 清空并重建缓存 |
 | `--no-sidecar` | off | 不写 `text_*.sim.json` |
 
 ## 输出
@@ -122,7 +120,6 @@ similarity = (cosine + 1) / 2
 | `batch_cloned_voices/eval_sim_summary.json` | overall + 分数据集 mean/p50/p10/p90 |
 | `batch_cloned_voices/eval_sim_details.jsonl` | 逐条 JSONL |
 | `{说话人}/text_XXX.sim.json` | 每条 sidecar 结果 |
-| `eval_sim_embedding_cache/` | ref/clone embedding 磁盘缓存 |
 
 抽样时文件名带后缀，如 `eval_sim_summary_200.json`。
 
@@ -164,9 +161,6 @@ sidecar（`voice_clone` 写入的 `text_*.json`）需含：
 
 **相似度偏低但 CER 很好？**  
 克隆读了正确内容，但音色偏离参考说话人——需调 OmniVoice 克隆参数或 checkpoint。
-
-**换权重后旧缓存不准？**  
-`python eval_clone_similarity.py --skip-cache`
 
 **能否评不同 checkpoint 的克隆？**  
 可以；sidecar 里 `model` 字段会写入报告，按 `--out-dir` 扫描即可。

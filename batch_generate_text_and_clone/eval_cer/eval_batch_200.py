@@ -16,14 +16,13 @@ import json
 import os
 import random
 import re
+import socket
 import string
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -65,6 +64,8 @@ def eval_paths_full(out_dir: Path) -> dict[str, Path]:
         "asr_cache": out_dir / "eval_asr_cache.json",
         "llm_cache": out_dir / "eval_llm_itn_cache.json",
         "summary": out_dir / "eval_summary.json",
+        "summary_progress": out_dir / "eval_summary_progress.json",
+        "details_jsonl": out_dir / "eval_cer_details.jsonl",
         "details_manual": out_dir / "eval_details_manual.txt",
         "details_llm": out_dir / "eval_details_llm.txt",
         "comparison": out_dir / "eval_comparison.txt",
@@ -734,13 +735,46 @@ def build_eval_item(wav_path: Path, json_path: Path, hypo_raw: str) -> dict:
     }
 
 
-def run_asr(sampled, use_cache: bool, cache_path: Path) -> dict:
-    if use_cache and cache_path.exists():
-        cache = load_json(cache_path)
-        print(f"Loaded ASR cache: {len(cache)} results from {cache_path}")
-        return cache
+def run_asr(
+    sampled,
+    use_cache: bool,
+    cache_path: Path,
+    on_batch_done=None,
+    batch_size: int = 16,
+) -> dict:
+    """Run ASR; optionally call on_batch_done(batch_pairs, results) and flush cache each batch."""
+    results = load_json(cache_path) if cache_path.exists() else {}
+    if results:
+        print(f"Loaded ASR cache: {len(results)} entries from {cache_path}", flush=True)
 
-    print("Loading Qwen3-ASR model...")
+    if use_cache:
+        missing = [(w, j) for w, j in sampled if not results.get(str(w))]
+        if not missing:
+            print(f"ASR cache covers all {len(sampled)} items.", flush=True)
+            return results
+        print(
+            f"ASR cache partial: {len(sampled) - len(missing)}/{len(sampled)} hit, "
+            f"running ASR on {len(missing)} remaining",
+            flush=True,
+        )
+        sampled = missing
+    elif results:
+        sampled = [(w, j) for w, j in sampled if not results.get(str(w))]
+        if not sampled:
+            print("All items already in ASR cache.", flush=True)
+            return results
+
+    def _flush_cache():
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    if not sampled:
+        return results
+
+    print("Loading Qwen3-ASR model...", flush=True)
     sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")
     from qwen_asr import Qwen3ASRModel
 
@@ -749,13 +783,12 @@ def run_asr(sampled, use_cache: bool, cache_path: Path) -> dict:
         QWEN3_ASR_LOCAL,
         dtype=torch.bfloat16,
         device_map=device,
-        max_inference_batch_size=8,
+        max_inference_batch_size=batch_size,
         max_new_tokens=256,
     )
-    print("Model loaded.\n")
+    print(f"Model loaded (ASR batch_size={batch_size}).\n", flush=True)
 
-    results = {}
-    batch_size = 8
+    results = dict(results)
     for i in tqdm(range(0, len(sampled), batch_size), desc="ASR"):
         batch = sampled[i:i + batch_size]
         audio_inputs = []
@@ -781,19 +814,110 @@ def run_asr(sampled, use_cache: bool, cache_path: Path) -> dict:
             for wav_path, h in zip(valid_paths, hypos):
                 results[str(wav_path)] = h.text
         except Exception as e:
-            print(f"ASR batch error: {e}")
+            print(f"ASR batch error: {e}", flush=True)
             for wav_path in valid_paths:
                 results[str(wav_path)] = ""
+
+        if on_batch_done is not None:
+            on_batch_done(batch, results)
+        _flush_cache()
 
     del asr
     torch.cuda.empty_cache()
 
-    cache_path.write_text(
-        json.dumps(results, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"ASR cache saved to {cache_path}")
+    _flush_cache()
+    print(f"ASR cache saved to {cache_path} ({len(results)} entries)", flush=True)
     return results
+
+
+def transcribe_asr_batch(asr, batch_pairs: list, results: dict) -> None:
+    """Run Qwen3-ASR on one batch; merge hypos into results dict."""
+    audio_inputs = []
+    valid_paths = []
+    for wav_path, _ in batch_pairs:
+        try:
+            speech = extract_speech(wav_path)
+            audio_inputs.append((speech, 16000))
+            valid_paths.append(wav_path)
+        except Exception as e:
+            print(f"Error loading {wav_path}: {e}", flush=True)
+            results[str(wav_path)] = ""
+
+    if not audio_inputs:
+        return
+
+    try:
+        hypos = asr.transcribe(
+            audio=audio_inputs,
+            language="Chinese",
+            return_time_stamps=False,
+        )
+        for wav_path, h in zip(valid_paths, hypos):
+            results[str(wav_path)] = h.text
+    except Exception as e:
+        print(f"ASR batch error: {e}", flush=True)
+        for wav_path in valid_paths:
+            results[str(wav_path)] = ""
+
+
+def load_asr_model(batch_size: int = 16):
+    """Load Qwen3-ASR model."""
+    print("Loading Qwen3-ASR model...", flush=True)
+    sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")
+    from qwen_asr import Qwen3ASRModel
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    asr = Qwen3ASRModel.from_pretrained(
+        QWEN3_ASR_LOCAL,
+        dtype=torch.bfloat16,
+        device_map=device,
+        max_inference_batch_size=batch_size,
+        max_new_tokens=256,
+    )
+    print(f"Model loaded (ASR batch_size={batch_size}).\n", flush=True)
+    return asr
+
+
+def llm_itn_batch_fetch(batch: list[dict]) -> dict[str, dict]:
+    """Call LLM ITN API for one batch; return wav -> {ref_final, hypo_final}."""
+    if not batch:
+        return {}
+    batch_input = [
+        {"id": j, "ref": it["ref_manual_prep"], "hypo": it["hypo_manual_prep"]}
+        for j, it in enumerate(batch)
+    ]
+    raw = call_llm_itn_batch(batch_input)
+    by_id = {r["id"]: r for r in raw}
+    entries = {}
+    for j, it in enumerate(batch):
+        r = by_id.get(j, {})
+        ref_f, hyp_f = llm_itn_postprocess(
+            r.get("ref_final", ""),
+            r.get("hypo_final", ""),
+            it["ref_manual"],
+            it["hypo_manual"],
+        )
+        entries[it["wav"]] = {"ref_final": ref_f, "hypo_final": hyp_f}
+    return entries
+
+
+def llm_itn_one_batch(
+    batch: list[dict],
+    cache: dict,
+    cache_path: Path | None = None,
+    use_cache: bool = True,
+) -> dict[str, dict]:
+    """Run LLM ITN synchronously on one batch; update cache and optional cache file."""
+    pending = [it for it in batch if not (use_cache and it["wav"] in cache)]
+    if pending:
+        cache.update(llm_itn_batch_fetch(pending))
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    return {it["wav"]: cache[it["wav"]] for it in batch if it["wav"] in cache}
 
 
 def _extract_json_array(raw_text: str) -> list:
@@ -814,7 +938,7 @@ def _extract_json_array(raw_text: str) -> list:
     return data
 
 
-def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 3) -> list[dict]:
+def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 6) -> list[dict]:
     api_key = os.environ.get("ITN_LLM_API_KEY") or os.environ.get("LLM_API_KEY")
     base_url = os.environ.get("ITN_LLM_BASE_URL") or os.environ.get("LLM_BASE_URL", "")
     model = os.environ.get("ITN_LLM_MODEL") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
@@ -853,7 +977,6 @@ def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 3) -> list[di
     )
 
     last_err = None
-    max_retries = 6
     for attempt in range(max_retries):
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
@@ -863,77 +986,57 @@ def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 3) -> list[di
             return _extract_json_array(content)
         except urllib.error.HTTPError as e:
             last_err = e
-            if e.code == 429 and attempt + 1 < max_retries:
+            if attempt + 1 >= max_retries:
+                break
+            if e.code == 429:
                 time.sleep(min(60, 5 * (2 ** attempt)))
-                continue
-            if attempt + 1 < max_retries:
+            else:
                 time.sleep(2 ** attempt)
+        except (TimeoutError, socket.timeout) as e:
+            last_err = e
+            if attempt + 1 >= max_retries:
+                break
+            # Large batches can exceed read timeout; back off longer before retry.
+            time.sleep(min(120, 10 * (2 ** attempt)))
         except (urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError) as e:
             last_err = e
-            if attempt + 1 < max_retries:
-                time.sleep(2 ** attempt)
+            if attempt + 1 >= max_retries:
+                break
+            time.sleep(2 ** attempt)
     raise RuntimeError(f"LLM ITN failed after {max_retries} retries: {last_err}")
 
 
 def run_llm_itn(
     items: list[dict],
     cache_path: Path,
-    batch_size: int = 10,
-    concurrency: int = 5,
+    batch_size: int = 16,
+    concurrency: int = 1,
     use_cache: bool = True,
+    on_batch_done=None,
 ) -> dict:
     cache = {}
     if use_cache and cache_path.exists():
         cache = load_json(cache_path)
-        print(f"Loaded LLM ITN cache: {len(cache)} results from {cache_path}")
+        print(f"Loaded LLM ITN cache: {len(cache)} results from {cache_path}", flush=True)
 
     pending = [it for it in items if it["wav"] not in cache]
     if not pending:
-        print("All LLM ITN results cached.")
+        print("All LLM ITN results cached.", flush=True)
         return cache
 
     batches = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
     print(
         f"Running LLM ITN on {len(pending)} items "
-        f"(batch_size={batch_size}, concurrency={concurrency}, {len(batches)} requests)..."
+        f"(batch_size={batch_size}, {len(batches)} requests)...",
+        flush=True,
     )
 
-    cache_lock = threading.Lock()
+    for batch in tqdm(batches, desc="LLM ITN"):
+        entries = llm_itn_one_batch(batch, cache, cache_path, use_cache=use_cache)
+        if on_batch_done is not None:
+            on_batch_done(batch, entries, dict(cache))
 
-    def _process_batch(batch: list[dict]) -> dict:
-        batch_input = [
-            {"id": j, "ref": it["ref_manual_prep"], "hypo": it["hypo_manual_prep"]}
-            for j, it in enumerate(batch)
-        ]
-        results = call_llm_itn_batch(batch_input)
-        by_id = {r["id"]: r for r in results}
-        entries = {}
-        for j, it in enumerate(batch):
-            r = by_id.get(j, {})
-            ref_f, hyp_f = llm_itn_postprocess(
-                r.get("ref_final", ""),
-                r.get("hypo_final", ""),
-                it["ref_manual"],
-                it["hypo_manual"],
-            )
-            entries[it["wav"]] = {
-                "ref_final": ref_f,
-                "hypo_final": hyp_f,
-            }
-        return entries
-
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(_process_batch, batch) for batch in batches]
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="LLM ITN"):
-            entries = fut.result()
-            with cache_lock:
-                cache.update(entries)
-                cache_path.write_text(
-                    json.dumps(cache, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-
-    print(f"LLM ITN cache saved to {cache_path}")
+    print(f"LLM ITN cache saved to {cache_path} ({len(cache)} entries)", flush=True)
     return cache
 
 
@@ -1073,8 +1176,7 @@ def main():
                         help="RNG seed when creating sample list (default: 42 for 200, 43 for 500, else sample-size)")
     parser.add_argument("--skip-asr", action="store_true", help="Use cached ASR results")
     parser.add_argument("--skip-llm", action="store_true", help="Skip LLM ITN")
-    parser.add_argument("--llm-batch-size", type=int, default=10, help="Text pairs per LLM request")
-    parser.add_argument("--llm-concurrency", type=int, default=5, help="Parallel LLM requests")
+    parser.add_argument("--asr-batch-size", type=int, default=16, help="ASR + LLM ITN batch size")
     parser.add_argument("--refresh-llm-cache", action="store_true", help="Re-run LLM ITN")
     args = parser.parse_args()
 
@@ -1089,7 +1191,12 @@ def main():
         print("No valid samples found.")
         return
 
-    asr_results = run_asr(sampled, use_cache=args.skip_asr, cache_path=paths["asr_cache"])
+    asr_results = run_asr(
+        sampled,
+        use_cache=args.skip_asr,
+        cache_path=paths["asr_cache"],
+        batch_size=args.asr_batch_size,
+    )
     validate_asr_cache(sampled, asr_results)
 
     detailed = []
@@ -1118,8 +1225,7 @@ def main():
         llm_cache = run_llm_itn(
             llm_input_items,
             cache_path=paths["llm_cache"],
-            batch_size=args.llm_batch_size,
-            concurrency=args.llm_concurrency,
+            batch_size=args.asr_batch_size,
             use_cache=use_cache,
         )
         for item in detailed:
