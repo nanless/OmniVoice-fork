@@ -1,6 +1,6 @@
 # 儿童口语文本生成（text_generation）
 
-用 LLM 批量生成带 OmniVoice 非语言标签的儿童口语文本，供 `clone_dataset.py` 随机抽样克隆。
+用 LLM 批量生成带 OmniVoice 非语言标签的儿童口语文本，写入 JSONL 供 `voice_clone/clone_dataset.py` 随机抽样克隆。
 
 ## 目录
 
@@ -20,11 +20,11 @@ text_generation/
 
 | 文件 | 说明 |
 |------|------|
-| `llm_children_100k_asr_complete.jsonl` | 最终 10 万条（克隆脚本读取此文件） |
+| `llm_children_100k_asr_complete.jsonl` | **最终 10 万条**（克隆脚本读取） |
 | `.checkpoint_100k_asr_complete.jsonl` | 生成过程 checkpoint，支持断点续跑 |
 | `.raw_before_quality.jsonl` | 质检前原始快照 |
 
-克隆脚本 `clone_dataset.py` 默认读取：
+克隆脚本默认读取：
 
 ```
 batch_generated_text/llm_children_100k_asr_complete.jsonl
@@ -67,7 +67,7 @@ python run_100k_asr_complete.py
 
 断点续跑：再次执行同一命令，会从 `.checkpoint_100k_asr_complete.jsonl` 继续未完成的 task。
 
-小规模调试示例：
+小规模调试：
 
 ```bash
 GEN_TOTAL_TARGET=500 GEN_MAX_WORKERS=4 python run_100k_asr_complete.py
@@ -77,7 +77,7 @@ GEN_TOTAL_TARGET=500 GEN_MAX_WORKERS=4 python run_100k_asr_complete.py
 
 ```mermaid
 flowchart LR
-  TASK[任务列表 年龄/场景/长度/语种] --> LLM[并发 LLM batch]
+  TASK[任务列表<br/>年龄/场景/长度/语种] --> LLM[并发 LLM batch]
   LLM --> DEDUP[精确 + 语义去重]
   DEDUP --> QA[quality_filter]
   QA --> REFILL[refill_to_target 补量]
@@ -118,7 +118,7 @@ python llm_generate_texts.py
 2. 调用 `omnivoice.eval.wer.text_normalize`
 3. 清理 CJK 间多余空格
 
-克隆评测（`eval/`）使用的是 sidecar 里的原始 `gen_text` + 评测脚本内 ITN，**不直接读 JSONL 的 text_tn**；`text_tn` 主要用于其他 WER 流程或数据分析。
+`eval_cer` 使用的是 sidecar 里的原始 `gen_text` + 评测脚本内 ITN，**不直接读 JSONL 的 text_tn**；`text_tn` 主要用于其他 WER 流程或数据分析。
 
 ### `reprocess_quality.py`
 
@@ -131,11 +131,11 @@ python reprocess_quality.py \
   --target 100000
 ```
 
-适用：调整了 `quality_filter` / 去重阈值后，想从 raw 快照快速重建 JSONL。
+适用：调整了 `quality_filter` / 去重阈值后，从 raw 快照快速重建 JSONL。
 
 ## JSONL 记录格式
 
-每行一条 JSON，LLM 只需输出 `text` 及元数据；`text_tn` 由代码派生。
+每行一条 JSON，LLM 输出 `text` 及元数据；`text_tn` 由代码派生。
 
 ```json
 {
@@ -153,7 +153,7 @@ python reprocess_quality.py \
 
 | 字段 | 说明 |
 |------|------|
-| `text` | 带标签口语，供 TTS 克隆 |
+| `text` | 带标签口语，供 TTS 克隆（→ sidecar `gen_text`） |
 | `language` | `zh` / `en`，克隆时映射 OmniVoice 语种 |
 | `lang_type` | `pure_cn`、`pure_en`、`cn_mostly`、`en_mostly`、`frequent_mix` |
 | `length_type` | `ultra_short` … `very_long` |
@@ -166,12 +166,14 @@ python reprocess_quality.py \
 ```
 text_generation  →  llm_children_100k_asr_complete.jsonl
        ↓
-clone_dataset    →  batch_cloned_voices/**/text_*.wav + text_*.json
+voice_clone      →  batch_cloned_voices/**/text_*.wav + text_*.json
        ↓
-eval/            →  CER 报告 + text_*.eval.json
+eval_cer         →  CER 报告 + text_*.eval.json
+eval_sim         →  相似度报告 + text_*.sim.json
+eval_mos         →  UTMOS 报告 + text_*.mos.json
 ```
 
-克隆时每条参考音随机抽 **10 句** JSONL；sidecar 中 `gen_text` 即生成时的 `text` 字段。
+克隆时每条参考音随机抽 **10 句** JSONL（seed 与 `utt_id` 绑定，可复现）；sidecar 中 `gen_text` 即 JSONL 的 `text` 字段。
 
 ## 常见问题
 
@@ -179,10 +181,15 @@ eval/            →  CER 报告 + text_*.eval.json
 直接重跑 `run_100k_asr_complete.py`，checkpoint 会跳过已完成 task。
 
 **条数不够 10 万？**  
-查看日志里 `Quality reject breakdown`；可调低质检强度或增大 raw 生成量，或用 `reprocess_quality.py` 配合 `refill`。
+查看日志里 `Quality reject breakdown`；可调低质检强度或增大 raw 生成量，或用 `reprocess_quality.py` 配合 refill。
 
 **换模型 / API？**  
-改 `.env` 中 `LLM_MODEL`、`LLM_BASE_URL`；大规模跑前建议先用 `GEN_TOTAL_TARGET=100` 试跑。
+改 `.env` 中 `LLM_MODEL`、`LLM_BASE_URL`；大规模跑前建议 `GEN_TOTAL_TARGET=100` 试跑。
 
 **勿提交密钥**  
 `.env` 仅本地使用，不要加入 Git。
+
+## 上游文档
+
+- 总览：[../README.md](../README.md)
+- 克隆：[../voice_clone/README.md](../voice_clone/README.md)

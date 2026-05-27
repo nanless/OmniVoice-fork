@@ -5,7 +5,7 @@ Same pipeline as eval_batch_200.py, applied to every text_*.wav under --out-dir.
 
 Usage:
     conda activate omnivoice
-    cd batch_generate_text_and_clone/eval
+    cd batch_generate_text_and_clone/eval_cer
 
     python eval_cloned.py
     python eval_cloned.py --skip-asr --refresh-llm-cache

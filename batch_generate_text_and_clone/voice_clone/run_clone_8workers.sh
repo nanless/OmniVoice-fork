@@ -13,7 +13,7 @@ pids=()
 # GPU 0: workers 0-3
 for w in 0 1 2 3; do
   log="$LOG_DIR/gpu0_worker${w}.log"
-  CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u batch_generate_text_and_clone/clone_dataset.py \
+  CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u batch_generate_text_and_clone/voice_clone/clone_dataset.py \
     --gpu 0 --worker-id "$w" --num-workers "$NUM_WORKERS" \
     > "$log" 2>&1 &
   pids+=("$!")
@@ -23,7 +23,7 @@ done
 # GPU 1: workers 4-7
 for w in 4 5 6 7; do
   log="$LOG_DIR/gpu1_worker${w}.log"
-  CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 python -u batch_generate_text_and_clone/clone_dataset.py \
+  CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 python -u batch_generate_text_and_clone/voice_clone/clone_dataset.py \
     --gpu 1 --worker-id "$w" --num-workers "$NUM_WORKERS" \
     > "$log" 2>&1 &
   pids+=("$!")
