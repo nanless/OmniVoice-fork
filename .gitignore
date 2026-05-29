@@ -40,6 +40,8 @@ examples/exp*
 /batch_generate/v3_gpu*.log
 /TTS_eval_models/**/*.pth
 /TTS_eval_models/**/*.pt
+batch_generate_text_and_clone/eval_sim/model/avg_model.pt
+batch_generate_text_and_clone/eval_sim/model/.cache/
 /TTS_eval_models/wer/
 batch_generated_text
 batch_cloned_voices

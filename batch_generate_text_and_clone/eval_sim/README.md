@@ -37,14 +37,32 @@ cd batch_generate_text_and_clone/eval_sim
 
 ## 模型权重
 
-首次使用前确认 `model/avg_model.pt` 存在：
+`model/avg_model.pt`（约 192 MB）**不入库**（超过 GitHub 100MB 限制）。官方来源：
+
+**[WeNet — voxblink2_samresnet100_ft.zip](https://wenet.org.cn/downloads?models=wespeaker&version=voxblink2_samresnet100_ft.zip)**
+
+GitHub Release 页亦指向上述链接。
+
+### 一键软链（推荐）
+
+1. 浏览器打开上述链接，下载 zip 到本地
+2. 解压并软链：
 
 ```bash
-# 从已有 checkpoint 复制或软链
-ln -sf /path/to/voxblink2_samresnet100/avg_model.pt model/avg_model.pt
+bash download_model.sh /path/to/voxblink2_samresnet100_ft.zip
 ```
 
-默认 checkpoint 来源：`voxblink2_samresnet100`（与 `wespeaker/examples/extract_and_conclude_similarities/v2_organized` 相同）。
+脚本将权重解压到 `model/.cache/` 并创建 `model/avg_model.pt` → 缓存内 `avg_model.pt` 的软链。
+
+### 手动软链
+
+若已有 checkpoint 目录：
+
+```bash
+ln -sf /path/to/voxblink2_samresnet100_ft/avg_model.pt model/avg_model.pt
+```
+
+与 `wespeaker` 官方 `voxblink2_samresnet100_ft` 微调权重一致（SimAM_ResNet100 + ASP）。
 
 ## 快速开始
 

@@ -39,10 +39,15 @@ LOG_DIR="$OUT_DIR/logs/eval_all"
 mkdir -p "$LOG_DIR"
 
 export PYTHONUNBUFFERED=1
+# One thread per worker process; parallelism comes from --workers, not OpenMP.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-1}"
 # CER uses GPU from env; SIM/MOS spawn workers with --gpus
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 
 PYTHON="${PYTHON:-/root/miniforge3/envs/omnivoice/bin/python}"
+PYTHON_CER="${PYTHON_CER:-/root/miniforge3/envs/qwen3-asr/bin/python}"
 MODEL_SIM="$ROOT/batch_generate_text_and_clone/eval_sim/model"
 MODEL_MOS="${TTS_EVAL_MODEL_DIR:-$ROOT/TTS_eval_models}"
 
@@ -63,6 +68,12 @@ run_py() {
   stdbuf -oL -eL "$PYTHON" -u "$@" 2>&1 | stdbuf -oL tee -a "$logfile"
 }
 
+run_py_cer() {
+  local logfile=$1
+  shift
+  stdbuf -oL -eL "$PYTHON_CER" -u "$@" 2>&1 | stdbuf -oL tee -a "$logfile"
+}
+
 COMMON=(--out-dir "$OUT_DIR")
 [[ "${SKIP_EXISTING:-1}" == "1" ]] && COMMON+=(--skip-existing)
 
@@ -74,6 +85,7 @@ PARALLEL_SIM="${PARALLEL_SIM:-1}"
 
 log "======== Full eval: CER ${PARALLEL_SIM:+(+ SIM parallel) }→ MOS ========"
 log "OUT=$OUT_DIR GPUS=$GPUS ASR_BATCH=$ASR_BATCH_SIZE ITN_WORKERS=$LLM_CONCURRENCY WORKERS=$EVAL_WORKERS PARALLEL_SIM=$PARALLEL_SIM SKIP_EXISTING=${SKIP_EXISTING:-1}"
+log "PYTHON=$PYTHON PYTHON_CER=$PYTHON_CER"
 log "Logs: $LOG_DIR"
 
 CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE" --llm-concurrency "$LLM_CONCURRENCY")
@@ -83,10 +95,10 @@ CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE" --llm-concurrency 
 [[ "${REFRESH_LLM:-0}" == "1" ]] && CER_ARGS+=(--refresh-llm-cache)
 
 run_cer() {
-  log "[CER] START eval_cloned.py"
+  log "[CER] START eval_cloned.py ($PYTHON_CER)"
   : > "$CER_LOG"
   (cd "$ROOT/batch_generate_text_and_clone/eval_cer" && \
-    run_py "$CER_LOG" eval_cloned.py "${CER_ARGS[@]}")
+    run_py_cer "$CER_LOG" eval_cloned.py "${CER_ARGS[@]}")
   log "[CER] END"
 }
 

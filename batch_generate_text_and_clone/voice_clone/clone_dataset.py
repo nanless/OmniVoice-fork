@@ -74,6 +74,18 @@ def load_texts(path):
     return texts
 
 
+SUPPORTED_LANGS = {"zh", "en", "ja", "de", "fr", "es", "ko", "ar", "ru", "pt", "it"}
+
+
+def resolve_language(raw_lang):
+    """Map raw language field to a valid OmniVoice language code, defaulting to 'zh'."""
+    lang_map = {"en_mostly": "en", "frequent_mix": "zh", "cn_mostly": "zh"}
+    ov_lang = lang_map.get(raw_lang, raw_lang)
+    if ov_lang not in SUPPORTED_LANGS:
+        return "zh"
+    return ov_lang
+
+
 def clone_one(model, text, ref_audio, ref_text, out_wav, language="zh"):
     speed = round(random.uniform(SPEED_MIN, SPEED_MAX), 2)
     try:
@@ -85,7 +97,6 @@ def clone_one(model, text, ref_audio, ref_text, out_wav, language="zh"):
             generation_config=GEN_CONFIG,
             speed=speed,
         )
-        out_wav.parent.mkdir(parents=True, exist_ok=True)
         # Resample from model SR (24k) to target 16k using high-quality sinc interpolation
         if model.sampling_rate != OUTPUT_SR:
             audio_tensor = torch.from_numpy(audio[0]).float().unsqueeze(0)
@@ -156,17 +167,31 @@ def main():
             rel = Path(ref_audio).relative_to(ds)
             base_dir = OUT_ROOT / ds_name / rel.parent / rel.stem
 
+            # Check if all texts for this audio are already done (WAV or JSON exists)
+            all_done = True
+            for tidx in range(1, TEXTS_PER_AUDIO + 1):
+                out_wav = base_dir / f"text_{tidx:03d}.wav"
+                out_json = base_dir / f"text_{tidx:03d}.json"
+                if not out_wav.exists() and not out_json.exists():
+                    all_done = False
+                    break
+            if all_done:
+                total_skip += TEXTS_PER_AUDIO
+                continue
+
             for tidx, text_item in enumerate(sampled_texts, 1):
                 out_wav = base_dir / f"text_{tidx:03d}.wav"
                 out_json = base_dir / f"text_{tidx:03d}.json"
 
-                if out_wav.exists():
+                if out_wav.exists() or out_json.exists():
                     total_skip += 1
                     continue
 
-                # Map lang_type to OmniVoice language code
-                lang_map = {"en_mostly": "en", "frequent_mix": "zh", "cn_mostly": "zh"}
-                ov_lang = lang_map.get(text_item["language"], text_item["language"])
+                # Ensure output directory exists before generation attempt
+                out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+                # Map language to valid OmniVoice language code
+                ov_lang = resolve_language(text_item["language"])
                 ok, speed = clone_one(
                     model, text_item["text"], ref_audio, ref_text, out_wav, ov_lang
                 )
