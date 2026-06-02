@@ -7,6 +7,7 @@ Round 2:  SCOREQ + TTSDS2 on CPU (multiprocess)
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -19,18 +20,24 @@ import torch
 import torchaudio
 import torch.multiprocessing as mp
 
+# Suppress verbose third-party logs before any imports
+for noisy in ("httpx", "httpcore", "fsspec", "onnxruntime", "lightning", 
+              "pytorch_lightning", "transformers", "huggingface_hub"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
 sys.path.insert(0, str(Path(__file__).parent))
 from scorers import create_scorer
 
 OUT_DIR = Path("/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned")
 MODEL_DIR = Path("/root/code/github_repos/OmniVoice-fork/TTS_eval_models")
-LOG_PATH = OUT_DIR / "logs" / "eval_fast.log"
+LOG_PATH = OUT_DIR / "logs" / "eval_mos_full.log"
 
-UTMOS_BS = 32
-UTMOSV2_BS = 8
+UTMOS_BS = 16
+UTMOSV2_BS = 4
 
 # ---------------------------------------------------------------------------
 # Tee logger: print to stdout AND append to file, always flushed
+# Only captures explicit prints, not stderr from third-party libs
 # ---------------------------------------------------------------------------
 class TeeLogger:
     def __init__(self, filepath: Path):
@@ -50,7 +57,7 @@ class TeeLogger:
         self._file.flush()
 
 sys.stdout = TeeLogger(LOG_PATH)
-sys.stderr = sys.stdout  # errors also go to the same tee
+# Keep stderr separate to avoid capturing library debug spam
 
 
 def fast_scan(out_dir: Path) -> List[Path]:
