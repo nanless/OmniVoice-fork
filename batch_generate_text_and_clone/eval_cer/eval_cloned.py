@@ -95,13 +95,13 @@ def main():
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("/root/code/github_repos/OmniVoice-fork/batch_cloned_voices"),
+        default=Path("/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned"),
     )
     parser.add_argument("--skip-asr", action="store_true", help="Use cached ASR results")
     parser.add_argument("--skip-llm", action="store_true", help="Skip LLM ITN")
     parser.add_argument("--batch-size", type=int, default=16, help="ASR + ITN batch size")
     parser.add_argument("--asr-batch-size", type=int, default=None, help="Alias for --batch-size")
-    parser.add_argument("--llm-concurrency", type=int, default=5, help="Parallel ITN workers")
+    parser.add_argument("--llm-concurrency", type=int, default=12, help="Parallel ITN workers (3 GPUs x 4 concurrent requests)")
     parser.add_argument("--refresh-llm-cache", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
@@ -248,7 +248,7 @@ def main():
             del asr
             torch.cuda.empty_cache()
     else:
-        batch_queue: queue.Queue = queue.Queue(maxsize=args.llm_concurrency * 2)
+        batch_queue: queue.Queue = queue.Queue(maxsize=args.llm_concurrency * 6)
 
         def itn_worker(worker_id: int):
             while True:
@@ -288,6 +288,9 @@ def main():
                         if need:
                             eb.transcribe_asr_batch(asr, need, asr_results)
                             flush_asr_cache(paths["asr_cache"], asr_results)
+                        if bi % 500 == 0 and bi > 0:
+                            torch.cuda.empty_cache()
+                            log_line(f"  [ASR] cleared GPU cache at batch {bi}")
                     batch_items = build_batch_items(batch)
                     batch_queue.put(batch_items)
                     log_line(f"  [ASR batch {bi + 1}/{num_batches}] queued {len(batch_items)}")

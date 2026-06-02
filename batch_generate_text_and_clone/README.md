@@ -42,7 +42,7 @@ flowchart LR
 | 语音克隆 | JSONL + 4 个儿童 SV 数据集参考音 | `batch_cloned_voices/{数据集}/{说话人}/text_*.wav` |
 | CER 评测 | 克隆 wav + sidecar `gen_text` | `batch_cloned_voices/eval_*` + `text_*.eval.json` |
 | 相似度评测 | 克隆 wav + sidecar `ref_audio` | `batch_cloned_voices/eval_sim_*` + `text_*.sim.json` |
-| UTMOS 评测 | 克隆 wav | `batch_cloned_voices/eval_mos_*` + `text_*.mos.json` |
+| 质量评测 (多指标) | 克隆 wav | `batch_cloned_voices/eval_summary*` + `text_*.mos.json` |
 
 ## 环境一览
 

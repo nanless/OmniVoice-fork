@@ -34,7 +34,7 @@ DATASETS = [
 
 TEXTS_PATH = "/root/code/github_repos/OmniVoice-fork/batch_generated_text/llm_children_100k_asr_complete.jsonl"
 MODEL_PATH = "/root/code/github_repos/OmniVoice-fork/exp/children_finetune_20260519_1418/checkpoints/checkpoint-62000"
-OUT_ROOT = Path("/root/code/github_repos/OmniVoice-fork/batch_cloned_voices")
+OUT_ROOT = Path("/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned")
 
 GEN_CONFIG = OmniVoiceGenerationConfig(
     num_step=32, guidance_scale=2.0, class_temperature=0.1,

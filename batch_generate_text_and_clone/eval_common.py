@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 
@@ -96,17 +97,15 @@ def _is_clone_sidecar(name: str) -> bool:
     return not any(name.endswith(s) for s in SIDEcar_SUFFIXES)
 
 
-def iter_clone_records(out_dir: Path) -> Iterator[Tuple[Path, Path, Dict[str, Any]]]:
-    """Yield (wav_path, sidecar_json, meta) for status=generated clones."""
-    out_dir = Path(out_dir)
-    n = 0
-    t0 = time.time()
-    for root, dirs, files in os.walk(out_dir):
+def _scan_dir(root: str) -> List[Tuple[str, str, dict]]:
+    """Scan a single directory tree for clone records."""
+    results = []
+    for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for name in files:
             if not _is_clone_sidecar(name):
                 continue
-            json_path = Path(root) / name
+            json_path = Path(dirpath) / name
             wav_path = json_path.with_suffix(".wav")
             if not wav_path.is_file():
                 continue
@@ -116,23 +115,46 @@ def iter_clone_records(out_dir: Path) -> Iterator[Tuple[Path, Path, Dict[str, An
                 continue
             if meta.get("status") != "generated":
                 continue
-            n += 1
-            if n % 50000 == 0:
-                print(f"[scan] {n} items … {time.time() - t0:.1f}s", flush=True)
-            yield wav_path, json_path, meta
+            results.append((str(wav_path), str(json_path), meta))
+    return results
 
 
-def list_clone_items(out_dir: Path, label: str = "scan") -> List[Tuple[Path, Path]]:
+def iter_clone_records(out_dir: Path, workers: int = 8) -> Iterator[Tuple[Path, Path, Dict[str, Any]]]:
+    """Yield (wav_path, sidecar_json, meta) for status=generated clones."""
+    out_dir = Path(out_dir)
     t0 = time.time()
-    items = [(w, j) for w, j, _ in iter_clone_records(out_dir)]
+
+    # Collect immediate subdirs to scan in parallel
+    subdirs = [str(p) for p in out_dir.iterdir() if p.is_dir() and p.name not in SKIP_DIRS]
+    total = 0
+
+    if len(subdirs) > 1 and workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_scan_dir, sd): sd for sd in subdirs}
+            for future in as_completed(futures):
+                batch = future.result()
+                total += len(batch)
+                if total % 50000 < len(batch):
+                    print(f"[scan] {total} items … {time.time() - t0:.1f}s", flush=True)
+                for wav_s, json_s, meta in batch:
+                    yield Path(wav_s), Path(json_s), meta
+    else:
+        # Fallback to single-threaded for small trees
+        for wav_s, json_s, meta in _scan_dir(str(out_dir)):
+            yield Path(wav_s), Path(json_s), meta
+
+
+def list_clone_items(out_dir: Path, label: str = "scan", scan_workers: int = 8) -> List[Tuple[Path, Path]]:
+    t0 = time.time()
+    items = [(w, j) for w, j, _ in iter_clone_records(out_dir, workers=scan_workers)]
     print(f"[{label}] {len(items)} clones in {time.time() - t0:.1f}s", flush=True)
     return items
 
 
-def list_clone_pairs(out_dir: Path, label: str = "scan") -> List[Tuple[Path, Path, Path]]:
+def list_clone_pairs(out_dir: Path, label: str = "scan", scan_workers: int = 8) -> List[Tuple[Path, Path, Path]]:
     t0 = time.time()
     pairs = []
-    for cloned, json_path, meta in iter_clone_records(out_dir):
+    for cloned, json_path, meta in iter_clone_records(out_dir, workers=scan_workers):
         ref = meta.get("ref_audio")
         if ref and Path(ref).is_file():
             pairs.append((cloned, Path(ref), json_path))

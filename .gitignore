@@ -47,3 +47,4 @@ batch_generated_text
 batch_cloned_voices
 *.log
 *.json
+*.txt

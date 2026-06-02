@@ -1,10 +1,10 @@
 #!/bin/bash
-# 全库评测：CER → SIM → MOS，sidecar 写在音频旁，tmux 后台运行
+# 全库评测：CER → SIM → MOS(多指标)，sidecar 写在音频旁，tmux 后台运行
 #
 # Sidecar（与 text_001.wav 同目录）：
 #   text_001.eval.json  CER
 #   text_001.sim.json   说话人相似度
-#   text_001.mos.json   UTMOS
+#   text_001.mos.json   质量评测（UTMOS22Strong / SCOREQ / TTSDS2 / UTMOSv2）
 #
 # Usage:
 #   bash batch_generate_text_and_clone/run_eval_all.sh          # 自动 tmux 后台
@@ -150,4 +150,4 @@ if [[ "${SKIP_MOS:-0}" != "1" ]]; then
 fi
 
 log "======== ALL DONE ========"
-log "Sidecars: text_*.eval.json / text_*.sim.json / text_*.mos.json (incremental per item/batch)"
+log "Sidecars: text_*.eval.json (CER) / text_*.sim.json (SIM) / text_*.mos.json (质量多指标)"

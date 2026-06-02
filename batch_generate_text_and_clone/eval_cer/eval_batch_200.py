@@ -12,6 +12,7 @@ Steps:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import random
@@ -20,6 +21,7 @@ import socket
 import string
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 import warnings
@@ -39,7 +41,7 @@ EVAL_DIR = Path(__file__).resolve().parent
 ENV_FILE = EVAL_DIR / ".env"
 QWEN3_ASR_LOCAL = "/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local"
 TAGS_PY = EVAL_DIR.parent / "text_generation" / "llm_generate_texts.py"
-OUT_DIR = Path("/root/code/github_repos/OmniVoice-fork/batch_cloned_voices")
+OUT_DIR = Path("/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned")
 DEFAULT_SAMPLE_SIZE = 200
 DEFAULT_SAMPLE_SEED = 42
 
@@ -97,180 +99,37 @@ PUNCTUATION = set(
     + "\u2026"
 )
 
-ITN_SYSTEM_PROMPT = """你是 ASR 评测第二阶段 ITN（逆文本归一化）专家。
+ITN_SYSTEM_PROMPT = """你是ASR评测ITN专家。对ref/hyp文本对做逆文本归一化+交叉对齐，消除虚假字错。
 
-## 输入说明
-你将收到 **已完成第一阶段手工 ITN** 的 ref / hyp 文本对。
-手工 ITN **不完备**，可能漏掉数字、单位、同音对齐、拼音/汉字统一等；你的任务是在此基础上 **继续 ITN + ref/hyp 交叉对齐**。
+## 核心规则
+1. **等价统一**：读音/语义相同仅写法不同→统一为ref侧形式，hyp跟随
+2. **真差异不对齐**：不同名词/动词/数字/语义保留
+3. **输出**：JSON数组 [{"id":0,"ref_final":"...","hypo_final":"..."}]，小写无标点保留空格
 
-**输入已做（勿重复破坏）：** 去标签、部分数字/单位归一化、去标点、英文小写。
-**输入保留空格**——便于分词、对齐英文单词与中文片段；**输出也请保留单词间空格**（不要删光空格、不要把英文词粘在一起）。
+## 语义词标签处理（重要）
+ref中可能有标签，ASR会识别出对应语气词。**ref有标签时，删除hyp中对应语气词**：
+- [sigh]→哎/唉 | [question-ah]→啊 | [question-ei]→诶/哎 | [question-yi]→咦
+- [surprise-ah]→啊 | [surprise-oh]→哦 | [surprise-wa]→哇 | [surprise-yo]→哟
+- [dissatisfaction-hnn]→哼/嗯/hmm | [confirmation-en]→嗯 | [laughter]→哈哈
 
-## 核心目标
-消除「写法不同但说的同一件事」造成的虚假字错，使 CER 反映真实读音/内容差异。
-**不是**改写语义、不是帮 ASR 纠错、不是润色。
+例：ref `第7题甲乙合作慢点慢点[question-yi]` hyp `第七题甲乙合作慢点慢点咦` → 删除`咦`
 
-## 总原则
-1. **成对处理**：ref、hyp 对照阅读，按语义片段对齐后再改。
-2. **等价则统一**：读音/语义相同、仅写法不同 → 统一为 **ref 侧形式**，hyp 跟随 ref。
-3. **ref 也可补全**：手工 ITN 在 ref 侧也可能漏归一化，ref_final 可修正 ref 中遗漏项，但 **不要** 改变 ref 语义；无明确收益时 **保持 ref 与输入一致**。
-4. **不确定保留**；**真差异不对齐**（不同名词、动词、数字、语义）。
-5. **禁止** 错误合并英文单词（如把 `just described` 合成 `justdescribed`）。
-6. **空格**：英文词间保留空格；**中文与英文/数字相邻处不要插入空格**（`哎we` 正确，`哎 we` 错误）；中文词间若无 ref 侧空格则不要新增。
+## 数字/单位
+- 中文数词→阿拉伯：一百二十→120 | 逐字读数：三零二→302 | 英文：forty-five→45
+- 百分数：百分之八十/80percent→80 | 分数：三分之七→3分之7
+- 单位：km/h→kmh，centimeters→cm，3minutes→3min
+- 保留小数点：12.5≠125 | 一样/一般/一起不转1
 
----
+## 同音对齐
+- 人名：芳芳/方方 | 词语：刻舟/勾舟 | 拼音↔汉字：hongjun→红军
+- 公式：a²+b²=c²↔a块大c色块 | 英文变体：question1/questionone
 
-## 第二阶段任务（按顺序）
-
-### A. 补全手工 ITN 遗漏（ref、hyp 各自检查）
-
-**数字（手工可能漏转）**
-- 中文数词→阿拉伯：`一百二十`→`120`，`四十五`→`45`，`三千`→`3000`
-- 逐字读数：`三零二`→`302`，`八八七七`→`8877`，`eight eight seven seven`→`8877`
-- 英文数词：`forty-five`→`45`，`one hundred and twenty`→`120`，`twelve point three`→`12.3`
-- 百分数：`百分之八十`/`80 percent`/`eighty percent`→`80`；`八百分之`→`80`（ASR 语序错误）
-- 分数：`三分之七`→`3分之7`；金额：`一块五`→`1块5`，`两块三毛`→`2块3`
-- **保留小数点**：`12.5` 不能变成 `125`
-- 单字「一~九」**仅**跟量词/单位时转换；**不**转 `一样`/`一般`/`一些`/`一起` 内的「一」
-- 专名/地名如 `零丁洋`、`一诺千金` 不误转
-
-**单位**
-- `km/h`、`kilometers per hour`→`kmh`；`centimeters`/`centimetres`→`cm`；`millimeters`→`mm`
-- `3 minutes`/`3 mins`→`3min`；`45 kmh` 数字与单位可连写 `45kmh`
-
-**标签残留**
-- 若仍有 `[question-oh]` 等方括号标签，删除且不保留标签内文字
-
-**标点残留**
-- 删除剩余标点，**保留数字内小数点**（如 `12.5`）
-
----
-
-### B. ref ↔ hyp 交叉对齐（核心）
-
-**B1. 同音/近音字**
-音节相同或 ASR 常见近音 → 统一为 ref 用字，hyp 跟随。
-- 人名：芳芳/方方、皓轩/浩轩
-- 词语：刻舟/勾舟、求剑/球鞋（非此例）
-- 数学术语误听：**求斜边** / **球鞋边**（同音 qiú xié biān）→ 跟 ref `求斜边`
-
-**B2. 拼音/罗马音 ↔ 汉字**
-语义相同 → 跟 ref 侧形式（ref 拼音则 hyp 转拼音；ref 汉字则 hyp 转汉字）。
-- `hong jun bu pa yuan zheng nan` ↔ `红军不怕远征难`
-- `qi lv chang zheng` ↔ `七律长征`
-- `shan shui yi zhou pang bo` ↔ `山水一州磅礴`
-
-**B3. 书名/诗名/专名**
-- `yueyang lou ji` ↔ `岳阳楼记` ↔ `Yueyang Lou Ji`
-- `song yuan er shi an xi` ↔ `松原二使安息`（《送元二使安西》近音）
-- `not that yueyang lou ji` / `not that 岳阳楼记` → 两侧统一
-
-**B4. 公式/符号 ↔ 近音读法**
-- `a²+b²=c²` ↔ `a块大c色块` ↔ `A块大 C色块`
-- `rt△` ↔ `r t` / `R T`（直角三角形符号）
-- 保留 ref 中公式前后的功能词（如 `but`、`which`）
-
-**B5. 感叹词/语气词（读音等价）**
-- `wow` ↔ `哇`；`oh` ↔ `哦`
-- 例：ref `拍错像佩奇 wow`，hyp `拍错像佩奇 哇` → hyp 改为 `拍错像佩奇 wow`
-
-**B6. 纠正语境中的同一数值**
-两侧都在自我纠正时，同一位置数值应对齐。
-- ref `221bc`，hyp `202呀 bc`（都在纠正年份）→ hyp `221bc`
-
-**B7. 英文写法变体**
-- `question 1` / `question one` → 跟 ref
-- 同一词不同拼写/空格 → 跟 ref
-- **禁止** 把两个英文词合成一个词
-
----
-
-### C. 明确不要对齐
-
-- 语义/读音确实不同：`bar chart` / `bartlett`，`doctor brown` / `doctor不让你`，`wait` / `weight`，`3min` / `3米`
-- hyp **多出** ref 没有的语气词：`啊`、`呀`、`哎`、`嗯`、`呃`（保留字但 **勿** 在其前后加空格）
-- ref 的重复/停顿：`不对不对`、`被…被`——不要强行删 ref 侧内容；hyp 也不伪造 ref 没有的重复
-- 不同动词/名词/数字：即使上下文相似也不对齐
-
----
-
-## 输出格式
-只输出 JSON 数组，不要 markdown 代码块：
-[{"id": 0, "ref_final": "...", "hypo_final": "..."}, ...]
-
-ref_final、hypo_final：**小写、无标点、保留空格**（单词/片段之间用单空格）。
-
----
-
-## 示例（学会规则即可泛化到未列出的 case）
-
-**例1 百分数+英文数词（补全+保留差异）**
-ref: `80%和120块 wait`
-hyp: `八百分之和一百二十块 weight`
-→ ref: `80和120块 wait` / hyp: `80和120块 weight`（weight≠wait 保留）
-
-**例2 同音人名**
-ref: `芳芳的 blue shirt`
-hyp: `方方的 blue shirt`
-→ ref: `芳芳的 blue shirt` / hyp: `芳芳的 blue shirt`
-
-**例3 同音成语**
-ref: `刻舟求剑`
-hyp: `勾舟求剑`
-→ ref: `刻舟求剑` / hyp: `刻舟求剑`
-
-**例4 拼音诗名**
-ref: `hong jun bu pa yuan zheng nan`
-hyp: `红军不怕远征难`
-→ ref: `hong jun bu pa yuan zheng nan` / hyp: `hong jun bu pa yuan zheng nan`
-
-**例5 书名拼音↔汉字**
-ref: `not that yueyang lou ji its the first line`
-hyp: `not that 岳阳楼记 is the first line`
-→ ref: `not that yueyang lou ji its the first line`
-   hyp: `not that yueyang lou ji its the first line`
-
-**例6 数学同音+公式读法**
-ref: `rt△求斜边 a²+b²=c² but 哪个是a哪个是b啊 晕了`
-hyp: `r t 球鞋边 a块大 c色块 到底哪个是a哪个是b呀 哎 晕了`
-→ ref: `rt△求斜边 a²+b²=c² but 哪个是a哪个是b啊 晕了`
-   hyp: `rt△求斜边 a²+b²=c² 到底哪个是a哪个是b呀 哎 晕了`
-（对齐公式与同音词；保留 hyp 多出的 `到底`/`呀`/`哎` 若 ref 无对应）
-
-**例7 感叹词**
-ref: `拍错像佩奇 wow`
-hyp: `拍错像佩奇 哇`
-→ ref: `拍错像佩奇 wow` / hyp: `拍错像佩奇 wow`
-
-**例8 纠正语境数值**
-ref: `应该是221bc不是202`
-hyp: `应该是202呀 bc不是221`
-→ ref: `应该是221bc不是202` / hyp: `应该是221bc不是202`
-
-**例9 英文逐字读数**
-ref: `call eight eight seven seven`
-hyp: `call 8877`
-→ ref: `call 8877` / hyp: `call 8877`
-
-**例10 小数保留**
-ref: `twelve point five meters`
-hyp: `12.5米`
-→ ref: `12.5 meters` / hyp: `12.5米`（对齐后单位形式跟 ref 或统一）
-
-**例11 一样不转1**
-ref: `这样一样的问题`
-hyp: `这样1样的问题`
-→ ref: `这样一样的问题` / hyp: `这样一样的问题`
-
-**例12 真差异不对齐**
-ref: `draw a bar chart`
-hyp: `draw a bartlett`
-→ 两侧保持不同（chart≠bartlett）
-
-**例13 单位**
-ref: `speed is 45 km/h`
-hyp: `speed is 45 kilometers per hour`
-→ ref: `speed is 45kmh` / hyp: `speed is 45kmh`
+## 示例
+ref: `80%和120块wait` hyp: `八百分之和一百二十块weight` → `80和120块weight`
+ref: `芳芳的blue shirt` hyp: `方方的blue shirt` → `芳芳的blue shirt`
+ref: `call eight eight seven seven` hyp: `call 8877` → `call 8877`
+ref: `第7题甲乙合作慢点慢点[question-yi]` hyp: `第七题甲乙合作慢点慢点咦` → 删除`咦`
+ref: `i fell why[dissatisfaction-hnn]` hyp: `i fell why hmm` → 删除`hmm`
 """
 
 
@@ -287,6 +146,35 @@ def load_env_file(path: Path):
 
 load_env_file(ENV_FILE)
 
+# ── Multi-endpoint round-robin ──────────────────────────────────────
+_LLM_ENDPOINTS = []
+_LLM_ENDPOINT_LOCK = threading.Lock()
+_LLM_ENDPOINT_IDX = 0
+
+
+def _init_llm_endpoints():
+    global _LLM_ENDPOINTS
+    urls_str = os.environ.get("ITN_LLM_BASE_URLS", "")
+    if urls_str:
+        _LLM_ENDPOINTS = [u.strip().rstrip("/") for u in urls_str.split(",") if u.strip()]
+    else:
+        single = os.environ.get("ITN_LLM_BASE_URL", "")
+        if single:
+            _LLM_ENDPOINTS = [single.strip().rstrip("/")]
+    if not _LLM_ENDPOINTS:
+        raise RuntimeError(f"Set ITN_LLM_BASE_URLS or ITN_LLM_BASE_URL in {ENV_FILE}")
+
+
+def _next_llm_endpoint() -> str:
+    global _LLM_ENDPOINT_IDX
+    with _LLM_ENDPOINT_LOCK:
+        endpoint = _LLM_ENDPOINTS[_LLM_ENDPOINT_IDX % len(_LLM_ENDPOINTS)]
+        _LLM_ENDPOINT_IDX += 1
+    return endpoint
+
+
+_init_llm_endpoints()
+
 # ── load tag definitions ────────────────────────────────────────────
 def load_tag_names(path):
     code = Path(path).read_text(encoding="utf-8")
@@ -299,6 +187,22 @@ def load_tag_names(path):
 
 TAG_NAMES = load_tag_names(TAGS_PY)
 TAG_PATTERN = re.compile("(" + "|".join(re.escape(t) for t in TAG_NAMES) + ")")
+
+# 标签到语气词的映射
+TAG_TO_PARTICLE = {
+    "[sigh]": "哎",
+    "[question-ah]": "啊",
+    "[laughter]": "哈哈",
+    "[question-oh]": "哦",
+    "[question-ei]": "诶",
+    "[question-yi]": "咦",
+    "[surprise-ah]": "啊",
+    "[surprise-oh]": "哦",
+    "[surprise-wa]": "哇",
+    "[surprise-yo]": "哟",
+    "[dissatisfaction-hnn]": "嗯",
+    "[confirmation-en]": "嗯",
+}
 
 
 def load_json(path):
@@ -319,6 +223,11 @@ def extract_speech(wav_path, target_sr=16000):
 
 def remove_tags(text):
     return TAG_PATTERN.sub("", text).strip()
+
+
+def keep_tags(text):
+    """保留标签，用于大模型ITN输入"""
+    return text
 
 
 def strip_punctuation(text):
@@ -618,9 +527,14 @@ def normalize_numbers(text: str) -> str:
     return text
 
 
-def manual_itn_preprocess(text: str) -> str:
-    """Stage-1 ITN (LLM input and manual baseline)."""
-    return finalize_cer_text(strip_punctuation(normalize_numbers(remove_tags(text))).lower())
+def manual_itn_preprocess(text: str, keep_tag: bool = False) -> str:
+    """Stage-1 ITN (LLM input and manual baseline).
+    
+    Args:
+        keep_tag: True保留标签用于大模型ITN，False删除标签用于CER计算
+    """
+    processed = text if keep_tag else remove_tags(text)
+    return finalize_cer_text(strip_punctuation(normalize_numbers(processed)).lower())
 
 
 def manual_itn(text: str) -> str:
@@ -708,8 +622,9 @@ def build_eval_item(wav_path: Path, json_path: Path, hypo_raw: str) -> dict:
 
     ref_manual = manual_itn(truth_raw)
     hyp_manual = manual_itn(hypo_raw)
-    ref_manual_prep = manual_itn_preprocess(truth_raw)
-    hyp_manual_prep = manual_itn_preprocess(hypo_raw)
+    # 保留标签版本，用于大模型ITN输入
+    ref_manual_prep = manual_itn_preprocess(truth_raw, keep_tag=True)
+    hyp_manual_prep = manual_itn_preprocess(hypo_raw, keep_tag=False)
     manual_cer, csub, cins, cdel, cnum = calc_cer(ref_manual, hyp_manual)
 
     return {
@@ -860,13 +775,13 @@ def transcribe_asr_batch(asr, batch_pairs: list, results: dict) -> None:
             results[str(wav_path)] = ""
 
 
-def load_asr_model(batch_size: int = 16):
+def load_asr_model(batch_size: int = 16, gpu_id: int = 0):
     """Load Qwen3-ASR model."""
     print("Loading Qwen3-ASR model...", flush=True)
     sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")
     from qwen_asr import Qwen3ASRModel
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     asr = Qwen3ASRModel.from_pretrained(
         QWEN3_ASR_LOCAL,
         dtype=torch.bfloat16,
@@ -874,7 +789,7 @@ def load_asr_model(batch_size: int = 16):
         max_inference_batch_size=batch_size,
         max_new_tokens=256,
     )
-    print(f"Model loaded (ASR batch_size={batch_size}).\n", flush=True)
+    print(f"Model loaded (ASR batch_size={batch_size}, gpu={gpu_id}).\n", flush=True)
     return asr
 
 
@@ -938,12 +853,19 @@ def _extract_json_array(raw_text: str) -> list:
     return data
 
 
-def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 6) -> list[dict]:
-    api_key = os.environ.get("ITN_LLM_API_KEY") or os.environ.get("LLM_API_KEY")
-    base_url = os.environ.get("ITN_LLM_BASE_URL") or os.environ.get("LLM_BASE_URL", "")
-    model = os.environ.get("ITN_LLM_MODEL") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
-    if not api_key or not base_url:
-        raise RuntimeError(f"Set ITN_LLM_API_KEY and ITN_LLM_BASE_URL in {ENV_FILE}")
+def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 6, endpoint: str = None) -> list[dict]:
+    from openai import OpenAI
+    
+    api_key = os.environ.get("ITN_LLM_API_KEY") or os.environ.get("LLM_API_KEY", "EMPTY")
+    model = os.environ.get("ITN_LLM_MODEL") or os.environ.get("LLM_MODEL", "qwen3.6-27b")
+    if endpoint is None:
+        endpoint = _next_llm_endpoint()
+    
+    # endpoint格式: http://localhost:8000/v1
+    client = OpenAI(
+        api_key=api_key,
+        base_url=endpoint.rstrip("/"),
+    )
 
     user_lines = [
         "以下 pairs 为第一阶段手工 ITN 结果（已去标签/部分数字/去标点/小写，**保留空格**）。",
@@ -956,53 +878,29 @@ def call_llm_itn_batch(batch_items: list[dict], max_retries: int = 6) -> list[di
             f"hypo: {item['hypo']}",
         ])
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": ITN_SYSTEM_PROMPT},
-            {"role": "user", "content": "\n".join(user_lines)},
-        ],
-        "max_tokens": 8192,
-        "temperature": 0,
-    }
-    endpoint = base_url.rstrip("/") + "/chat/completions"
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
     last_err = None
     for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                raw = response.read().decode("utf-8")
-            data = json.loads(raw)
-            content = data["choices"][0]["message"]["content"]
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": ITN_SYSTEM_PROMPT},
+                    {"role": "user", "content": "\n".join(user_lines)},
+                ],
+                max_tokens=4096,
+                temperature=0,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            content = response.choices[0].message.content
             return _extract_json_array(content)
-        except urllib.error.HTTPError as e:
+        except Exception as e:
             last_err = e
             if attempt + 1 >= max_retries:
                 break
-            if e.code == 429:
+            if "429" in str(e):
                 time.sleep(min(60, 5 * (2 ** attempt)))
             else:
                 time.sleep(2 ** attempt)
-        except (TimeoutError, socket.timeout) as e:
-            last_err = e
-            if attempt + 1 >= max_retries:
-                break
-            # Large batches can exceed read timeout; back off longer before retry.
-            time.sleep(min(120, 10 * (2 ** attempt)))
-        except (urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError) as e:
-            last_err = e
-            if attempt + 1 >= max_retries:
-                break
-            time.sleep(2 ** attempt)
     raise RuntimeError(f"LLM ITN failed after {max_retries} retries: {last_err}")
 
 
@@ -1025,16 +923,41 @@ def run_llm_itn(
         return cache
 
     batches = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+    num_endpoints = len(_LLM_ENDPOINTS)
+    effective_concurrency = max(concurrency, num_endpoints * 2)  # 2 workers per endpoint
     print(
         f"Running LLM ITN on {len(pending)} items "
-        f"(batch_size={batch_size}, {len(batches)} requests)...",
+        f"(batch_size={batch_size}, {len(batches)} requests, "
+        f"{num_endpoints} endpoints, concurrency={effective_concurrency})...",
         flush=True,
     )
 
-    for batch in tqdm(batches, desc="LLM ITN"):
-        entries = llm_itn_one_batch(batch, cache, cache_path, use_cache=use_cache)
-        if on_batch_done is not None:
-            on_batch_done(batch, entries, dict(cache))
+    cache_lock = threading.Lock()
+    error_list = []
+
+    def process_batch(batch_idx, batch):
+        try:
+            entries = llm_itn_one_batch(batch, cache, cache_path, use_cache=use_cache)
+            if on_batch_done is not None:
+                with cache_lock:
+                    on_batch_done(batch, entries, dict(cache))
+        except Exception as e:
+            error_list.append(e)
+            print(f"LLM ITN batch {batch_idx} error: {e}", flush=True)
+
+    if num_endpoints > 1 and len(batches) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+            futures = []
+            for i, batch in enumerate(batches):
+                futures.append(executor.submit(process_batch, i, batch))
+            for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="LLM ITN"):
+                f.result()
+    else:
+        for i, batch in enumerate(tqdm(batches, desc="LLM ITN")):
+            process_batch(i, batch)
+
+    if error_list:
+        print(f"WARNING: {len(error_list)} LLM ITN errors", flush=True)
 
     print(f"LLM ITN cache saved to {cache_path} ({len(cache)} entries)", flush=True)
     return cache

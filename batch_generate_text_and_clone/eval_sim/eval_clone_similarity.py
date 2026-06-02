@@ -52,7 +52,7 @@ DEFAULT_OUT_DIR = Path(
 
 
 def find_clone_pairs(out_dir: Path) -> List[Tuple[Path, Path, Path]]:
-    return list_clone_pairs(out_dir, label="sim-scan")
+    return list_clone_pairs(out_dir, label="sim-scan", scan_workers=8)
 
 
 def write_sim_json(json_path: Path, record: dict):
@@ -113,6 +113,15 @@ def _sim_worker(
 ):
     """One process: own CUDA context + model on assigned GPU."""
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     out = Path(out_dir)
     details = Path(details_path)
 

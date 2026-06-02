@@ -6,7 +6,7 @@ cd /root/code/github_repos/OmniVoice-fork
 
 PYTHON="${PYTHON:-/root/miniforge3/envs/omnivoice/bin/python}"
 
-LOG_DIR="batch_cloned_voices/logs"
+LOG_DIR="/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned/logs"
 mkdir -p "$LOG_DIR"
 
 NUM_WORKERS=16

@@ -170,7 +170,7 @@ voice_clone      →  batch_cloned_voices/**/text_*.wav + text_*.json
        ↓
 eval_cer         →  CER 报告 + text_*.eval.json
 eval_sim         →  相似度报告 + text_*.sim.json
-eval_mos         →  UTMOS 报告 + text_*.mos.json
+eval_mos         →  质量多指标报告 (UTMOS22Strong/SCOREQ/TTSDS2/UTMOSv2) + text_*.mos.json
 ```
 
 克隆时每条参考音随机抽 **10 句** JSONL（seed 与 `utt_id` 绑定，可复现）；sidecar 中 `gen_text` 即 JSONL 的 `text` 字段。
