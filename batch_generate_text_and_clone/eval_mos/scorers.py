@@ -457,58 +457,50 @@ class UTMOSv2Scorer(BaseScorer):
 
     @torch.no_grad()
     def score_file(self, wav_path: Union[str, Path]) -> float:
-        return float(self.model.predict(input_path=str(wav_path), device=self.device, verbose=False))
+        return float(self.model.predict(
+            input_path=str(wav_path), device=self.device, verbose=False,
+            remove_silent_section=False,
+        ))
 
-    def score_files(self, wav_paths: List[Union[str, Path]], batch_size: int = 4) -> List[float]:
-        """Batch inference using utmosv2's internal DataLoader with OOM protection."""
+    def score_files(self, wav_paths: List[Union[str, Path]], batch_size: int = 64) -> List[float]:
+        """Fast batch inference via utmosv2 internal DataLoader.
+
+        We pad the whole batch into one ndarray and let ``predict`` handle the
+        DataLoader / collation internally with ``num_workers`` and no VAD.
+        """
         import numpy as np
         import torchaudio
 
-        MAX_AUDIO_LEN = 30 * 16000  # cap at 30s
-        MAX_BATCH_SAMPLES = 4 * 10 * 16000  # ~4 files × 10s
+        MAX_AUDIO_LEN = 30 * 16000
 
-        # Load and cap
-        indexed_audios = []
-        for idx, wp in enumerate(wav_paths):
+        # 1. Load all audios and cap at 30 s
+        max_len = 0
+        arrays = []
+        for wp in wav_paths:
             wav, sr = torchaudio.load(str(wp))
             if sr != 16000:
                 wav = torchaudio.transforms.Resample(sr, 16000)(wav)
             a = wav.squeeze(0).cpu().numpy()
             if a.shape[0] > MAX_AUDIO_LEN:
                 a = a[:MAX_AUDIO_LEN]
-            indexed_audios.append((idx, a))
+            arrays.append(a)
+            max_len = max(max_len, a.shape[0])
 
-        # Sort by length
-        indexed_audios.sort(key=lambda x: x[1].shape[0])
+        # 2. Build single padded ndarray → utmosv2 internal batching is efficient
+        batch = np.zeros((len(arrays), max_len), dtype=np.float32)
+        for i, a in enumerate(arrays):
+            batch[i, :len(a)] = a
 
-        results = [0.0] * len(wav_paths)
-        groups = []
-        current_group = []
-        current_len = 0
-
-        for idx, a in indexed_audios:
-            a_len = a.shape[0]
-            if current_group and (current_len + a_len > MAX_BATCH_SAMPLES or len(current_group) >= 4):
-                groups.append(current_group)
-                current_group = []
-                current_len = 0
-            current_group.append((idx, a))
-            current_len += a_len
-        if current_group:
-            groups.append(current_group)
-
-        for group in groups:
-            max_len = max(a.shape[0] for _, a in group)
-            batch = np.zeros((len(group), max_len), dtype=np.float32)
-            for i, (_, a) in enumerate(group):
-                batch[i, :len(a)] = a
-
-            scores = self.model.predict(data=batch, batch_size=len(group), verbose=False, device=self.device)
-            score_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
-            for i, (orig_idx, _) in enumerate(group):
-                results[orig_idx] = float(score_list[i])
-
-        return results
+        scores = self.model.predict(
+            data=batch,
+            batch_size=batch_size,
+            device=self.device,
+            num_workers=4,
+            remove_silent_section=False,
+            verbose=False,
+        )
+        score_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+        return [float(v) for v in score_list]
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ MODEL_DIR = Path("/root/code/github_repos/OmniVoice-fork/TTS_eval_models")
 LOG_PATH = OUT_DIR / "logs" / "eval_mos_full.log"
 
 UTMOS_BS = 16
-UTMOSV2_BS = 4
+UTMOSV2_BS = 128
 
 # ---------------------------------------------------------------------------
 # Tee logger: print to stdout AND append to file, always flushed
