@@ -47,4 +47,4 @@ batch_generated_text
 batch_cloned_voices
 *.log
 *.json
-*.txt
+*.txtbatch_generate_text_and_clone/sim_check/

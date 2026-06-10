@@ -837,6 +837,12 @@ def llm_itn_one_batch(
 
 def _extract_json_array(raw_text: str) -> list:
     text = raw_text.strip()
+    # Strip Qwen3 thinking tags
+    import re
+    text = re.sub(r"<\|thinker\|>.*?<\|/thinker\|>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<\|assistant\|>", "", text)
+    text = re.sub(r"<\|endoftext\|>", "", text)
+    # Strip markdown code fences
     for marker in ("```json", "```"):
         if marker in text:
             text = text.split(marker, 1)[1]
@@ -847,7 +853,12 @@ def _extract_json_array(raw_text: str) -> list:
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
         text = text[start:end + 1]
-    data = json.loads(text)
+    # Use raw_decode to ignore trailing content
+    decoder = json.JSONDecoder()
+    try:
+        data, _ = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        data = json.loads(text)
     if not isinstance(data, list):
         raise ValueError("Expected JSON array")
     return data
