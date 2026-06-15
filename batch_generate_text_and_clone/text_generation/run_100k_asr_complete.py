@@ -23,30 +23,41 @@ def main():
 
     output_jsonl = os.path.join(config.output_dir, "llm_children_100k_asr_complete.jsonl")
     checkpoint_path = os.path.join(config.output_dir, ".checkpoint_100k_asr_complete.jsonl")
+    task_status_path = os.path.join(config.output_dir, ".task_status_100k_asr_complete.json")
 
     api_key = (
         config.api_key
         or os.environ.get("LLM_API_KEY")
-        or os.environ.get("DEEPSEEK_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("VLLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or "EMPTY"
     )
-    if not api_key:
-        raise RuntimeError("API key is not set.")
 
     all_texts = gen.load_checkpoint(checkpoint_path)
     print(f"Loaded {len(all_texts)} existing texts from {checkpoint_path}", flush=True)
 
     seen_normalized, duplicate_context_index = gen.build_duplicate_index(all_texts)
-    tasks = gen.generate_task_list(config)
-    completed_task_ids = {t.get("task_id", -1) for t in all_texts}
+    task_config = gen.replace(
+        config,
+        total_target=max(config.total_target, int(config.total_target * config.oversample_ratio)),
+    )
+    tasks = gen.generate_task_list(task_config)
+    task_status = gen.load_task_status(task_status_path)
+    completed_task_ids = {
+        int(task_id)
+        for task_id, rec in task_status.items()
+        if gen.is_task_complete(rec, config.batch_size)
+    }
     pending_tasks = [t for t in tasks if t["task_id"] not in completed_task_ids]
 
     print(f"Total tasks: {len(tasks)} batch_size={config.batch_size} target={config.total_target}", flush=True)
     print(f"Pending tasks: {len(pending_tasks)}", flush=True)
+    print(f"Oversample ratio: {config.oversample_ratio:.2f}", flush=True)
     print(f"Seed: {config.seed}", flush=True)
     print(f"Output dir: {config.output_dir}", flush=True)
     print(f"Output: {output_jsonl}", flush=True)
     print(f"Checkpoint: {checkpoint_path}", flush=True)
+    print(f"Task status: {task_status_path}", flush=True)
     print(f"Truncate overlength: {config.truncate_overlength}", flush=True)
     print(f"Semantic dedup threshold: {config.semantic_dedup_threshold}", flush=True)
     print(f"Max workers: {config.max_workers}", flush=True)
@@ -84,6 +95,7 @@ def main():
 
                 try:
                     results = future.result(timeout=180)
+                    raw_count = len(results or [])
                     if results:
                         results, skipped = gen.filter_incremental_duplicates(
                             results,
@@ -93,11 +105,21 @@ def main():
                         )
                         skipped_duplicates += skipped
                         all_texts.extend(results)
+                        gen.update_task_status(
+                            task_status,
+                            task,
+                            "completed",
+                            raw_count=raw_count,
+                            accepted_count=len(results),
+                            skipped_duplicates=skipped,
+                        )
                         completed += 1
                     else:
+                        gen.update_task_status(task_status, task, "empty")
                         failed += 1
                 except Exception as exc:
                     print(f"Task {task['task_id']} failed: {exc}", flush=True)
+                    gen.update_task_status(task_status, task, "failed", error=str(exc))
                     failed += 1
 
                 done = completed + failed
@@ -108,10 +130,12 @@ def main():
                         flush=True,
                     )
                     gen.save_checkpoint(all_texts, checkpoint_path)
+                    gen.save_task_status(task_status, task_status_path)
 
                 submit_next_task()
 
     gen.save_checkpoint(all_texts, checkpoint_path)
+    gen.save_task_status(task_status, task_status_path)
     print(f"Raw checkpoint count: {len(all_texts)}", flush=True)
     print(f"Skipped near duplicates before checkpointing: {skipped_duplicates}", flush=True)
 
@@ -142,6 +166,8 @@ def main():
     )
     print(f"After refill: {len(processed)}", flush=True)
 
+    gen.ensure_text_ids(processed)
+    gen.print_generation_quality_report(gen.generation_quality_report(processed, config))
     gen.save_checkpoint(processed, output_jsonl)
 
     print("=== Final Statistics ===", flush=True)

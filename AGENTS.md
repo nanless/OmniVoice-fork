@@ -2,15 +2,34 @@
 
 ## 项目概述
 
-OmniVoice：基于离散扩散的大规模多语言零样本 TTS 系统。底层是 Qwen3-0.6B（双向注意力）+ 音频 Embedding/Head。支持 600+ 语言，voice cloning 和 voice design。
+OmniVoice (v0.1.5)：基于离散扩散的大规模多语言零样本 TTS 系统。底层是 Qwen3-0.6B（双向注意力）+ 音频 Embedding/Head。支持 600+ 语言，voice cloning 和 voice design。
 
 ## 环境与依赖管理
 
 - **Python**: >= 3.10
 - **包管理**: `uv sync`（推荐）或 `pip install -e .`
+- **构建后端**: hatchling
 - **PyTorch**: 2.8.0（`pyproject.toml` 中通过 `uv.lock` 锁定），Linux/Win 使用 CUDA 12.8 版本
+- **transformers**: >= 5.3.0（**注意：这是非常新的版本**，确认环境中 transformers 版本足够）
 - **国内镜像**: `uv sync --default-index "https://mirrors.aliyun.com/pypi/simple"`
 - 如果 HuggingFace 下载慢: `export HF_ENDPOINT="https://hf-mirror.com"`
+
+## 开发工具链（重要）
+
+本仓库**没有**以下基础设施，Agent 不应尝试运行它们：
+
+| 工具 | 状态 |
+|------|------|
+| CI/CD (GitHub Actions) | **无** — `.github/` 仅含 issue templates |
+| 代码检查 (ruff/flake8/pylint) | **无配置** — 无 `[tool.ruff]` 等 |
+| 类型检查 (mypy/pyright) | **无配置** |
+| 单元测试 (pytest) | **无** — 无 `tests/`、无 `conftest.py`、无 pytest 配置 |
+| 格式化 (black/ruff format) | **无配置** |
+| Pre-commit hooks | **无** |
+
+`.gitignore` 中有 `.ruff_cache/` 和 `.mypy_cache/` 条目，但项目级无配置文件。
+
+**结论**：修改代码后没有自动化验证手段，需靠手动运行推理或训练脚本验证功能正确性。
 
 ## 常用命令
 
@@ -23,6 +42,9 @@ omnivoice-infer --model k2-fsa/OmniVoice --text "你好" --output out.wav
 # 声音克隆
 omnivoice-infer --model k2-fsa/OmniVoice --text "你好" \
     --ref_audio ref.wav --ref_text "参考文本" --output out.wav
+
+# 批量推理
+omnivoice-infer-batch --model k2-fsa/OmniVoice --input input.jsonl --output_dir out/
 
 # Web UI
 omnivoice-demo --ip 0.0.0.0 --port 8001
@@ -41,7 +63,7 @@ audio = model.generate(text="你好", ref_audio="ref.wav", ref_text="参考文�
 ### 训练
 
 ```bash
-# 多卡训练
+# 多卡训练（注意：训练 CLI 未注册为 project.scripts，必须用 -m 方式）
 accelerate launch --gpu_ids "0,1" --num_processes 2 \
     -m omnivoice.cli.train \
     --train_config train_config.json \
@@ -50,6 +72,7 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 ```
 
 参考完整流程：`examples/run_finetune.sh`、`finetune_children.sh`
+参考配置文件：`examples/config/`（含 finetune、emilia、multilingual、DeepSpeed ZeRO-2 配置）
 
 ## 架构要点
 
@@ -59,17 +82,31 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 |------|------|
 | `omnivoice/models/omnivoice.py` | **核心文件 (~1600 行)**，模型定义 + generate() + 推理全流程 |
 | `omnivoice/cli/` | CLI 入口：train.py, infer.py, infer_batch.py, demo.py |
-| `omnivoice/data/` | 数据流水线：dataset.py(WebDataset读取), processor.py(样本mask/tokenize), batching.py+pillator.py |
+| `omnivoice/data/` | 数据流水线：dataset.py(WebDataset读取), processor.py(样本mask/tokenize), batching.py, collator.py |
 | `omnivoice/training/` | 训练框架：config.py(TrainingConfig), builder.py(构建model/dataloader), trainer.py(OmniTrainer), checkpoint.py |
 | `omnivoice/eval/` | 评估：WER, 说话人相似度(ECAPA+WavLM), UTMOS自然度 |
 | `omnivoice/scripts/` | 预处理脚本：extract_audio_tokens.py(音频→RVQ token), jsonl_to_webdataset.py, denoise_audio.py |
 | `omnivoice/utils/` | 工具函数：audio.py, text.py, duration.py, lang_map.py, voice_design.py |
 
+### 公开 API（`omnivoice/__init__.py`）
+
+仅导出 3 个符号：`OmniVoice`, `OmniVoiceConfig`, `OmniVoiceGenerationConfig`（均来自 `omnivoice.models.omnivoice`）
+
+### 已注册的 CLI 入口（`pyproject.toml [project.scripts]`）
+
+| 命令 | 入口 |
+|------|------|
+| `omnivoice-infer` | `omnivoice.cli.infer:main` |
+| `omnivoice-infer-batch` | `omnivoice.cli.infer_batch:main` |
+| `omnivoice-demo` | `omnivoice.cli.demo:main` |
+
+**训练 CLI 没有注册为入口**，必须通过 `python -m omnivoice.cli.train` 或 `accelerate launch -m omnivoice.cli.train` 运行。
+
 ### 模型架构
 
 - **基座**: Qwen3-0.6B（28层, hidden=1536, 12头，**双向注意力**）
 - **新增模块**:
-  - `audio_embeddings`: nn.Embedding(8×1025, 1536) — 8层 codebook 共 享一个表，通过 `codebook_layer_offsets` 区分
+  - `audio_embeddings`: nn.Embedding(8×1025, 1536) — 8层 codebook 共享一个表，通过 `codebook_layer_offsets` 区分
   - `audio_heads`: nn.Linear(1536, 8×1025) — 从 hidden state 预测 8 层 audio token
 - **音频表示**: Higgs Audio V2 Tokenizer, 8 层 RVQ, 24kHz, 75Hz 帧率
 - **参数量**: ~0.625B（基座 0.6B + 新增 ~25M）
@@ -81,6 +118,7 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 - `drop_cond_ratio=0.1`: 10% 样本丢弃所有条件（用于 CFG 训练）
 - Loss: 8 层分别计算交叉熵，加权求和 `[8,8,6,6,4,4,2,2]`
 - 数据格式：WebDataset tar shards（含 .npy audio token）+ 对应 jsonl label
+- 支持 DeepSpeed ZeRO-2（`use_deepspeed=True` + `deepspeed_config` 指向 JSON）
 
 ### 推理机制
 
@@ -95,6 +133,8 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 |---------------------|------|------|
 | `flex_attention`（默认） | Sequence Packing: 多样本拼接成长序列 | PyTorch >= 2.5, Ampere+ GPU |
 | `sdpa` | Length-grouped Padding: 相近长度样本 padding 到 batch | 无特殊要求 |
+
+`max_sample_tokens`、`min_sample_tokens`、`max_batch_size` 仅在 `sdpa` 模式下生效。
 
 ## 关键注意事项
 
@@ -112,7 +152,7 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 4. 训练: `accelerate launch -m omnivoice.cli.train`
 
 ### Special Tokens
-训练时自动注入的 special tokens（`builder.py:73-84`）:
+训练时自动注入的 special tokens（`builder.py:72-84`）:
 `<|denoise|>`, `<|lang_start|>`, `<|lang_end|>`, `<|instruct_start|>`, `<|instruct_end|>`, `<|text_start|>`, `<|text_end|>`
 
 ### 显存调优
@@ -126,11 +166,31 @@ accelerate launch --gpu_ids "0,1" --num_processes 2 \
 ### 非代码文件
 - `docs/` 有中英文双语版本（`docs/zh/` 为中文版）
 - `README_技术详解.md` 和 `HOW_IT_WORKS.md` 是中文技术文档
-- `OmniVoice.ipynb` 是 Google Colab 示例 notebook
+- `docs/OmniVoice.ipynb` 和 `docs/zh/OmniVoice.ipynb` 是 Google Colab 示例 notebook
+- `examples/config/` 包含所有参考训练配置
+
+### TrainingConfig 关键默认值（`omnivoice/training/config.py`）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `llm_name_or_path` | `Qwen/Qwen3-0.6B` | 基座模型 |
+| `audio_vocab_size` | 1025 | 1024 valid + 1 mask |
+| `audio_mask_id` | 1024 | mask token ID |
+| `num_audio_codebook` | 8 | RVQ 层数 |
+| `audio_codebook_weights` | `[8,8,6,6,4,4,2,2]` | loss 加权 |
+| `batch_tokens` | 8192 | 每 batch token 上限 |
+| `attn_implementation` | `flex_attention` | 注意力实现方式 |
+| `mixed_precision` | `bf16` | 训练精度 |
+| `steps` | 300000 | 总训练步数 |
+| `learning_rate` | 1e-4 | 初始学习率 |
+| `save_steps` | 10000 | checkpoint 间隔 |
 
 ## 不要做的事
 
+- **不要**运行 `pytest`、`ruff`、`mypy` — 本仓库没有配置这些工具
 - **不要**在代码中假定 `speaker_id` 字段 — 训练是自监督的，不需要
 - **不要**假定音频采样率 — 始终使用 `model.sampling_rate` (24000)
 - **不要**忽略 `train` 参数 — 训练和推理模式的 `from_pretrained` 加载完全不同
 - **不要**在 CUDA 上使用 MPS device_map — audio tokenizer 不支持 MPS
+- **不要**尝试直接 `omnivoice-train` 命令 — 训练 CLI 未注册为 entry point
+- **不要**假定 `transformers` 是常见版本 — 本项目依赖 >= 5.3.0（API 可能与旧版不同）

@@ -10,6 +10,7 @@ text_generation/
 ├── .env                         # LLM API（勿提交 Git）
 ├── llm_generate_texts.py        # 核心：提示词、采样、去重、质检、并发 worker
 ├── run_100k_asr_complete.py     # 生产入口：10 万条 ASR 友好完整句
+├── qa_generated_texts.py         # 生成后 QA：分布、标签、text_tn、语种错配
 ├── text_tn.py                   # 从 text 派生 text_tn（ASR/WER 参考归一化）
 └── reprocess_quality.py         # 不重调 LLM，仅重跑质检/去重/补量
 ```
@@ -22,6 +23,7 @@ text_generation/
 |------|------|
 | `llm_children_100k_asr_complete.jsonl` | **最终 10 万条**（克隆脚本读取） |
 | `.checkpoint_100k_asr_complete.jsonl` | 生成过程 checkpoint，支持断点续跑 |
+| `.task_status_100k_asr_complete.json` | 每个 LLM batch 的 raw/accepted/status 记录，用于可靠续跑 |
 | `.raw_before_quality.jsonl` | 质检前原始快照 |
 
 克隆脚本默认读取：
@@ -35,12 +37,19 @@ batch_generated_text/llm_children_100k_asr_complete.jsonl
 在 `text_generation/.env` 或 shell 中设置：
 
 ```bash
-LLM_MODEL=mimo-v2.5          # 或 deepseek-chat 等
-LLM_API_KEY=...
-LLM_BASE_URL=https://your-api/v1
+LLM_MODEL=qwen3.6-27b          # 默认 Qwen3.6-27B（vLLM OpenAI 兼容 API）
+LLM_API_KEY=EMPTY              # 本地 vLLM 通常填 EMPTY
+LLM_BASE_URL=http://localhost:8000/v1
 ```
 
-也支持 `DEEPSEEK_API_KEY`、`ANTHROPIC_API_KEY` 作为 API Key 回退。
+也支持 `VLLM_API_KEY`、`OPENAI_API_KEY` 作为 API Key 回退。
+
+### vLLM 启动示例
+
+```bash
+vllm serve Qwen/Qwen3.6-27B --port 8000
+# 然后 LLM_BASE_URL=http://localhost:8000/v1
+```
 
 ### 可选环境变量（`apply_config_from_env`）
 
@@ -52,6 +61,7 @@ LLM_BASE_URL=https://your-api/v1
 | `GEN_SEED` | 随机种子 |
 | `GEN_OUTPUT_DIR` | 输出目录 |
 | `GEN_SEMANTIC_DEDUP_THRESHOLD` | 语义去重阈值（默认 0.88） |
+| `GEN_OVERSAMPLE_RATIO` | 初始 raw 生成倍数（默认 1.20），给去重/质检预留损耗 |
 | `GEN_MODEL` | 覆盖 `LLM_MODEL` |
 
 `.env` 在 import 时加载，**不会覆盖**已存在的 shell 环境变量。
@@ -65,7 +75,7 @@ cd batch_generate_text_and_clone/text_generation
 python run_100k_asr_complete.py
 ```
 
-断点续跑：再次执行同一命令，会从 `.checkpoint_100k_asr_complete.jsonl` 继续未完成的 task。
+断点续跑：再次执行同一命令，会同时参考 `.checkpoint_100k_asr_complete.jsonl` 和 `.task_status_100k_asr_complete.json`。只有 raw 数和 accepted 数都足够的 batch 才会视为完成，空返回、失败或明显部分返回会在后续运行中继续补跑。
 
 小规模调试：
 
@@ -109,6 +119,7 @@ python llm_generate_texts.py
 - **质检** `quality_filter`：标签密度、长度类型、严重长度不匹配等
 - **补量** `refill_to_target`：不足目标时追加生成
 - **text_tn**：可选自动派生（`generate_text_tn=True`）
+- **可靠续跑**：task 状态独立记录，不再只靠文本里的 `task_id` 反推完成状态
 
 ### `text_tn.py`
 
@@ -147,6 +158,7 @@ python reprocess_quality.py \
   "emotion": "happy",
   "age_tier": "preschool",
   "language": "zh",
+  "id": "gen_...",
   "text_tn": "嗯那个我要吃饭饭"
 }
 ```
@@ -154,6 +166,7 @@ python reprocess_quality.py \
 | 字段 | 说明 |
 |------|------|
 | `text` | 带标签口语，供 TTS 克隆（→ sidecar `gen_text`） |
+| `id` | 稳定生成文本 ID，供克隆 sidecar 与评测对齐 |
 | `language` | `zh` / `en`，克隆时映射 OmniVoice 语种 |
 | `lang_type` | `pure_cn`、`pure_en`、`cn_mostly`、`en_mostly`、`frequent_mix` |
 | `length_type` | `ultra_short` … `very_long` |
@@ -174,6 +187,18 @@ eval_mos         →  质量多指标报告 (UTMOS22Strong/SCOREQ/TTSDS2/UTMOSv2
 ```
 
 克隆时每条参考音随机抽 **10 句** JSONL（seed 与 `utt_id` 绑定，可复现）；sidecar 中 `gen_text` 即 JSONL 的 `text` 字段。
+当前抽样会优先覆盖不同 `lang_type`、`length_type`、`scenario`、`age_tier`；sidecar 会额外写入 `text_id`、`gen_text_tn`、`lang_type`、`length_type`、`scenario`、`subscene`、`emotion`、`age_tier`、`task_id`，方便分层评估。
+
+## 生成后 QA
+
+生成入口会在保存最终 JSONL 前打印 QA 摘要。也可以单独检查已有文件：
+
+```bash
+python qa_generated_texts.py
+python qa_generated_texts.py /path/to/llm_children_100k_asr_complete.jsonl --target 100000
+```
+
+QA 会统计条数、语种/句长/年龄/场景分布、tag 覆盖率、`text_tn` 空值和疑似 `lang_type`/内容错配；有明显风险时以 warning 输出并返回非零状态。
 
 ## 常见问题
 

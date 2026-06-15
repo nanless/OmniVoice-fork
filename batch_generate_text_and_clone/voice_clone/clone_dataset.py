@@ -62,16 +62,63 @@ def read_kaldi_map(path):
 def load_texts(path):
     texts = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             item = json.loads(line)
             texts.append({
+                "id": item.get("id") or item.get("text_id") or f"text_{line_no:06d}",
                 "text": item.get("text", ""),
                 "language": item.get("language", "zh"),
+                "lang_type": item.get("lang_type"),
+                "length_type": item.get("length_type"),
+                "scenario": item.get("scenario") or item.get("scenario_key"),
+                "subscene": item.get("subscene"),
+                "emotion": item.get("emotion"),
+                "age_tier": item.get("age_tier"),
+                "text_tn": item.get("text_tn"),
+                "task_id": item.get("task_id"),
             })
     return texts
+
+
+def sample_texts_for_audio(all_texts, utt_id, n=TEXTS_PER_AUDIO):
+    """Deterministically pick diverse texts for one reference audio."""
+    if len(all_texts) <= n:
+        return list(all_texts)
+
+    rng = random.Random(f"{SEED}:{utt_id}")
+    pool = list(all_texts)
+    rng.shuffle(pool)
+
+    selected = []
+    seen = {
+        "lang_type": set(),
+        "length_type": set(),
+        "scenario": set(),
+        "age_tier": set(),
+    }
+
+    while pool and len(selected) < n:
+        def diversity_score(idx):
+            item = pool[idx]
+            score = 0
+            for key, values in seen.items():
+                value = item.get(key)
+                if value and value not in values:
+                    score += 1
+            return (score, -idx)
+
+        best_idx = max(range(len(pool)), key=diversity_score)
+        item = pool.pop(best_idx)
+        selected.append(item)
+        for key, values in seen.items():
+            value = item.get(key)
+            if value:
+                values.add(value)
+
+    return selected
 
 
 SUPPORTED_LANGS = {"zh", "en", "ja", "de", "fr", "es", "ko", "ar", "ru", "pt", "it"}
@@ -118,14 +165,20 @@ def main():
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--texts-path",
+        default=TEXTS_PATH,
+        help="JSONL path with generated clone texts (default: children 100k)",
+    )
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = "cuda:0"
 
     print(f"Worker {args.worker_id}/{args.num_workers} on GPU {args.gpu}")
-    all_texts = load_texts(TEXTS_PATH)
-    print(f"Loaded {len(all_texts)} texts.")
+    texts_path = args.texts_path
+    all_texts = load_texts(texts_path)
+    print(f"Loaded {len(all_texts)} texts from {texts_path}.")
 
     print(f"Loading model …")
     model = OmniVoice.from_pretrained(MODEL_PATH, device_map=device, dtype=torch.float16)
@@ -161,8 +214,7 @@ def main():
             continue
 
         for i, (utt_id, ref_audio, ref_text) in enumerate(items, 1):
-            rng = random.Random(f"{SEED}:{utt_id}")
-            sampled_texts = rng.sample(all_texts, TEXTS_PER_AUDIO)
+            sampled_texts = sample_texts_for_audio(all_texts, utt_id, TEXTS_PER_AUDIO)
 
             rel = Path(ref_audio).relative_to(ds)
             base_dir = OUT_ROOT / ds_name / rel.parent / rel.stem
@@ -201,10 +253,19 @@ def main():
                         "status": "generated" if ok else "failed",
                         "ref_audio": ref_audio,
                         "ref_text": ref_text,
+                        "text_id": text_item.get("id"),
                         "gen_text": text_item["text"],
+                        "gen_text_tn": text_item.get("text_tn"),
                         "cloned_audio": str(out_wav) if ok else None,
                         "speed": speed,
                         "language": text_item["language"],
+                        "lang_type": text_item.get("lang_type"),
+                        "length_type": text_item.get("length_type"),
+                        "scenario": text_item.get("scenario"),
+                        "subscene": text_item.get("subscene"),
+                        "emotion": text_item.get("emotion"),
+                        "age_tier": text_item.get("age_tier"),
+                        "task_id": text_item.get("task_id"),
                         "model": MODEL_PATH,
                         "model_sr": model.sampling_rate,
                         "generated_at": datetime.now().isoformat(),

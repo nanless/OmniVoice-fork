@@ -26,6 +26,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TEXT_GENERATION_DIR = Path(__file__).resolve().parent
 _ENV_FILE = _TEXT_GENERATION_DIR / ".env"
 _DEFAULT_OUTPUT_DIR = str(_REPO_ROOT / "batch_generated_text")
+DEFAULT_LLM_MODEL = "qwen3.6-27b"
+DEFAULT_LLM_BASE_URL = "http://localhost:8000/v1"
 
 
 def load_env_file(env_path: Optional[Path] = None) -> None:
@@ -58,6 +60,7 @@ class GenConfig:
     batch_size: int = 8
     max_workers: int = 10
     generate_text_tn: bool = True
+    oversample_ratio: float = 1.20
     output_dir: str = _DEFAULT_OUTPUT_DIR
     seed: int = 42
     same_context_dup_threshold: float = 0.52
@@ -114,13 +117,13 @@ class GenConfig:
         "requests": 0.8,
     })
 
-    # LLM API (defaults from batch_generate_text_and_clone/text_generation/.env)
-    model: str = ""
+    # LLM API — default Qwen3.6-27B via local vLLM (OpenAI-compatible)
+    model: str = DEFAULT_LLM_MODEL
     api_key: Optional[str] = None
-    base_url: str = ""
+    base_url: str = DEFAULT_LLM_BASE_URL
     max_retries: int = 3
     retry_base_delay: float = 1.0
-    max_tokens: int = 8192
+    max_tokens: int = 4096
     temperature: float = 0.85
     truncate_overlength: bool = False
 
@@ -238,6 +241,15 @@ TAG_DEFINITIONS = {
             "[confirmation-en]好的好的",
         ],
         "forbidden": "不要在提问或否定场景使用。",
+    },
+    "[question-en]": {
+        "description": "英文疑问语气词 'huh?', 'hmm?', 'really?' 等",
+        "placement": "对英文内容的疑问反应，通常在句首或逗号后。",
+        "examples": [
+            "[question-en]Really? You said that?",
+            "[question-en]Huh, that's weird",
+        ],
+        "forbidden": "不要在肯定或确认场景使用，不要和 [confirmation-en] 混淆。",
     },
 }
 
@@ -1412,6 +1424,8 @@ def build_prompt(
     batch_size: int,
     suppression_hint: str = "",
     task_id: Optional[int] = None,
+    target_tag_count: Optional[int] = None,
+    emotion_intensity: Optional[str] = None,
 ) -> str:
     scenario = SCENARIOS[scenario_key]
     length_spec = LENGTH_SPECS[length_key]
@@ -1513,26 +1527,22 @@ DO NOT use: um, uh, ugh, soooo, sooo, super duper, like as filler, you know. The
         length_strict = """
 ⚠️ 长度约束 ⚠️
 当前任务: short（短句）。去掉标签后，中文最多8字/英文最多6词。
-标签按极低概率注入（约15%概率），大部分句子不需要标签。
 好例子: "那个，我要抱抱[laughter]", "不不不，才不是[dissatisfaction-hnn]", "妈妈我要吃糖"（无标签）
 """
     elif length_key == "medium":
         length_strict = """
 ⚠️ 长度约束 ⚠️
 当前任务: medium（中等）。去掉标签后，中文最多15字/英文最多12词。
-标签按极低概率注入（约20%概率），大部分句子不需要标签。
 """
     elif length_key == "long":
         length_strict = """
 ⚠️ 长度约束 ⚠️
 当前任务: long（较长）。去掉标签后，中文最多25字/英文最多20词。
-标签按极低概率注入（约20%概率），大部分句子不需要标签。
 """
     elif length_key == "very_long":
         length_strict = """
 ⚠️ 长度约束 ⚠️
 当前任务: very_long（长句）。去掉标签后，中文最多40字/英文最多35词。
-标签按低概率注入（约25%概率），约3/4句子无标签，有标签的通常只放1个。
 """
 
     prompt = f"""你是一位专业的儿童语音数据采集专家。请生成 {batch_size} 条听起来 EXACTLY 像真实儿童自然口语的文本。{lang_override}
@@ -1544,9 +1554,10 @@ DO NOT use: um, uh, ugh, soooo, sooo, super duper, like as filler, you know. The
 === 儿童画像 ===
 年龄: {age["name"]}
 场景: {scenario["name"]} — {subscene}
-情绪: {emotion}（标签密度: {emotion_profile["tag_density"]}，位置倾向: {emotion_profile["position_bias"]}）
+情绪: {emotion}（强度: {emotion_intensity or "中等自然"}，位置倾向: {emotion_profile["position_bias"]}）
 长度: {length_spec["cn"] if "cn" in lang_key else length_spec["en"]}
 语言: {lang_spec}
+本 batch 标签数目标: {target_tag_count if target_tag_count is not None else "自然分布"}（0=纯文本无标签，1=仅1个标签点缀，2-3=情绪强烈时）
 {stress_instruction}
 {reading_instruction}
 {diversity_instruction}
@@ -1628,19 +1639,10 @@ DO NOT use: um, uh, ugh, soooo, sooo, super duper, like as filler, you know. The
 - 短文本（ultra_short/short）最多1个标签
 - 中/长文本最多2-3个标签
 
-**标签密度控制（概率注入，不强制）**:
-- ultra_short: 0-1个标签，约10%概率注入
-- short: 0-1个标签，约15%概率注入
-- medium: 0-1个标签，约20%概率注入
-- long: 0-1个标签，约20%概率注入
-- very_long: 0-2个标签，约25%概率注入
-
-**标签注入原则（重要）**:
-- 绝大多数句子（约75-85%）不需要任何标签，保持自然口语即可
-- 仅在情绪特别强烈时才考虑加入1个标签，极少情况才用2个
-- 优先生成不带标签的纯文本，标签只是偶尔点缀
-- 幻想(fantasy)场景：建议约15%包含惊叹类标签 [surprise-wa] 或 [laughter]
-- 情绪爆发(emotions)场景：建议约20%包含情绪标签
+**标签数量（严格按儿童画像中的「标签数目标」执行）**:
+- 目标=0：纯文本，不加任何标签
+- 目标=1：最多放 1 个标签，位置自然
+- 目标=2-3：仅在情绪强烈时放 2-3 个，短文本不超过 1 个
 
 === 场景典型标签参考 ===
 本场景典型标签: {', '.join(scenario.get('typical_tags', []))}
@@ -2598,6 +2600,30 @@ def build_diversity_instructions(
 # API Client
 # ---------------------------------------------------------------------------
 
+def resolve_llm_credentials(config: Optional["GenConfig"] = None):
+    """Resolve model/api_key/base_url with Qwen3.6-27B + vLLM defaults."""
+    cfg = config or GenConfig()
+    api_key = (
+        cfg.api_key
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("VLLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or "EMPTY"
+    )
+    model = cfg.model or os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
+    multi_urls = os.environ.get("LLM_BASE_URLS", "")
+    if multi_urls:
+        urls = [u.strip().rstrip("/") for u in multi_urls.split(",") if u.strip()]
+        base_url = random.choice(urls)
+    else:
+        base_url = (
+            cfg.base_url or os.environ.get("LLM_BASE_URL") or DEFAULT_LLM_BASE_URL
+        ).rstrip("/")
+    return model, api_key, base_url
+
+
 def call_llm(
     prompt: str,
     model: str = "",
@@ -2605,24 +2631,26 @@ def call_llm(
     base_url: str = "",
     max_retries: int = 3,
     retry_base_delay: float = 1.0,
-    max_tokens: int = 8192,
+    max_tokens: int = 4096,
     temperature: float = 0.85,
 ) -> List[Dict]:
     import time
     import urllib.error
     import urllib.request
 
-    resolved_api_key = (
-        api_key
-        or os.environ.get("LLM_API_KEY")
-        or os.environ.get("DEEPSEEK_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
+    resolved_model, resolved_api_key, resolved_base_url = resolve_llm_credentials(
+        GenConfig(model=model or "", api_key=api_key, base_url=base_url)
     )
-    resolved_model = model or os.environ.get("LLM_MODEL", "")
-    resolved_base_url = base_url or os.environ.get("LLM_BASE_URL", "")
 
     def _extract_json(raw_text: str) -> List[Dict]:
         text = raw_text.strip()
+        # Qwen3.6 thinking mode: strip reasoning block before JSON
+        _think_close = "\x3c/think\x3e"
+        if _think_close in text:
+            text = text.split(_think_close, 1)[-1].strip()
+        _redacted_close = "</think>"
+        if _redacted_close in text:
+            text = text.split(_redacted_close, 1)[-1].strip()
         for marker in ("```json", "```"):
             if marker in text:
                 text = text.split(marker, 1)[1]
@@ -2658,6 +2686,7 @@ def call_llm(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         request = urllib.request.Request(
             endpoint,
@@ -2752,6 +2781,12 @@ def apply_config_from_env(config: GenConfig) -> GenConfig:
         config.batch_size = int(os.environ["GEN_BATCH_SIZE"])
     if os.environ.get("GEN_MAX_WORKERS"):
         config.max_workers = int(os.environ["GEN_MAX_WORKERS"])
+    if os.environ.get("GEN_OVERSAMPLE_RATIO"):
+        config.oversample_ratio = max(1.0, float(os.environ["GEN_OVERSAMPLE_RATIO"]))
+    if not config.model:
+        config.model = DEFAULT_LLM_MODEL
+    if not config.base_url:
+        config.base_url = DEFAULT_LLM_BASE_URL
     return config
 
 
@@ -2799,7 +2834,7 @@ def _init_reading_subscene_pools(rng: random.Random) -> Tuple[Dict[str, List[str
 def generate_task_list(config: GenConfig) -> List[Dict]:
     rng = random.Random(config.seed)
     tasks = []
-    total_batches = config.total_target // config.batch_size
+    total_batches = max(1, (config.total_target + config.batch_size - 1) // config.batch_size)
 
     regular_scenarios = {k: v for k, v in SCENARIOS.items() if not v.get("is_stress_test", False)}
     regular_keys = list(regular_scenarios.keys())
@@ -2846,6 +2881,13 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
         else:
             emotion = rng.choice(EMOTIONS)
 
+        target_tag_count = _weighted_choice(
+            {"0": 0.30, "1": 0.40, "2": 0.25, "3": 0.05}, rng,
+        )
+        emotion_intensity = rng.choice([
+            "强烈爆发", "中等自然", "轻微隐约", "压抑内敛",
+        ])
+
         tasks.append({
             "task_id": i,
             "scenario_key": scenario_key,
@@ -2854,6 +2896,8 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
             "lang_key": _weighted_choice(config.lang_mix_distribution, rng),
             "emotion": emotion,
             "age_tier": _weighted_choice(config.age_distribution, rng),
+            "target_tag_count": int(target_tag_count),
+            "emotion_intensity": emotion_intensity,
         })
 
     rng.shuffle(tasks)
@@ -2874,11 +2918,13 @@ def worker(task: Dict, config: GenConfig) -> List[Dict]:
         config.batch_size,
         task.get("suppression_hint", ""),
         task.get("task_id"),
+        target_tag_count=task.get("target_tag_count"),
+        emotion_intensity=task.get("emotion_intensity"),
     )
     temp_rng = random.Random(
         hashlib.md5(f"temp|{task.get('task_id')}|{task.get('scenario_key')}".encode()).hexdigest()
     )
-    batch_temperature = min(1.0, max(0.76, config.temperature + temp_rng.uniform(-0.08, 0.15)))
+    batch_temperature = min(1.0, max(0.65, config.temperature + temp_rng.uniform(-0.15, 0.15)))
 
     results = call_llm(
         prompt,
@@ -2942,6 +2988,18 @@ def _validate_tag_position(text: str) -> List[str]:
     return issues
 
 
+_TAG_CONFLICTS = [
+    ("laughter", "sigh"),
+    ("laughter", "dissatisfaction-hnn"),
+    ("surprise-wa", "sigh"),
+    ("surprise-wa", "dissatisfaction-hnn"),
+    ("surprise-yo", "sigh"),
+    ("surprise-yo", "dissatisfaction-hnn"),
+    ("confirmation-en", "sigh"),
+    ("confirmation-en", "dissatisfaction-hnn"),
+]
+
+
 def _validate_tag_combinations(text: str) -> List[str]:
     """Check for contradictory tag combinations."""
     issues = []
@@ -2949,11 +3007,10 @@ def _validate_tag_combinations(text: str) -> List[str]:
 
     tag_set = set(tags)
 
-    # Contradictory combinations
-    if "laughter" in tag_set and "sigh" in tag_set:
-        issues.append("laughter and sigh contradict")
+    for a, b in _TAG_CONFLICTS:
+        if a in tag_set and b in tag_set:
+            issues.append(f"{a} and {b} contradict")
 
-    # Too many similar tags
     surprise_tags = [t for t in tags if t.startswith("surprise-")]
     if len(set(surprise_tags)) >= 3:
         issues.append(f"too many surprise variants: {surprise_tags}")
@@ -2967,6 +3024,10 @@ def _validate_tag_combinations(text: str) -> List[str]:
 
 def _auto_correct_tags(text: str, _emotion: str = "") -> str:
     """Auto-correct common tag issues."""
+
+    text = re.sub(r"[.]{3,}", "，", text)
+    text = re.sub(r"…+", "，", text)
+    text = re.sub(r"，{2,}", "，", text)
 
     # Fix tag spacing: remove space before tag, ensure space after
     tag_pattern = re.compile(rf"\s*(\[({VALID_TAG_NAMES})\])\s*")
@@ -3125,6 +3186,46 @@ def _validate_length(text: str, length_type: str) -> bool:
     return lo <= total <= hi
 
 
+def _language_content_counts(text: str) -> Tuple[int, int]:
+    """Return rough CJK character count and English word count after stripping tags."""
+    clean = re.sub(r"\[[^\]]+\]", "", text)
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", clean))
+    english_words = len(re.findall(r"[A-Za-z]+(?:['-][A-Za-z]+)?", clean))
+    return cjk_count, english_words
+
+
+def _validate_language_content(item: Dict, text: Optional[str] = None) -> bool:
+    """Check that declared lang_type matches the actual Chinese/English mix."""
+    lang_type = item.get("lang_type")
+    text = text if text is not None else item.get("text", "")
+    cjk_count, english_words = _language_content_counts(text)
+    total = cjk_count + english_words
+    if total == 0:
+        return False
+
+    if lang_type == "pure_cn":
+        return cjk_count > 0 and english_words == 0
+    if lang_type == "pure_en":
+        return english_words > 0 and cjk_count == 0
+    if lang_type == "cn_mostly":
+        return cjk_count > 0 and cjk_count / total >= 0.55
+    if lang_type == "en_mostly":
+        return english_words > 0 and english_words / total >= 0.55
+    if lang_type == "frequent_mix":
+        return cjk_count > 0 and english_words > 0 and min(cjk_count, english_words) / total >= 0.20
+    return False
+
+
+_TAG_REQUIRED_SCENARIOS = {
+    "emotions",
+    "stress_numbers",
+    "stress_tongue_twister",
+    "stress_emotion_shift",
+    "stress_stutter_repair",
+    "stress_whisper_shout",
+}
+
+
 def _is_reading_item(item: Dict) -> bool:
     sk = item.get("scenario") or item.get("scenario_key") or ""
     sub = item.get("subscene") or ""
@@ -3139,6 +3240,9 @@ def _min_required_tags_for_item(item: Dict) -> int:
         if length_type in ("long", "very_long", "medium"):
             return 0
         return min(base, 1)
+    if item.get("scenario") in _TAG_REQUIRED_SCENARIOS or item.get("scenario_key") in _TAG_REQUIRED_SCENARIOS:
+        if length_type != "ultra_short":
+            return max(base, 1)
     return base
 
 
@@ -3191,6 +3295,9 @@ def diagnose_quality_rejections(texts: List[Dict]) -> Counter:
             "pure_cn", "pure_en", "cn_mostly", "en_mostly", "frequent_mix",
         }:
             reasons["lang_type"] += 1
+            continue
+        if not _validate_language_content(item, text):
+            reasons["language_content"] += 1
             continue
         if _find_invalid_tags(text):
             reasons["invalid_tags"] += 1
@@ -3404,17 +3511,34 @@ def build_frequency_suppression_hint(
             if phrase in lower:
                 reading_phrase_counter[phrase] += 1
 
-    def hot_terms(counter: Counter, min_count: int, limit: int) -> List[str]:
-        return [term for term, count in counter.most_common(limit) if count >= min_count]
+    n = len(recent)
+    pct_threshold = 0.0125
 
-    hot_openings = hot_terms(opening_counter, max(4, len(recent) // 80), 8)
-    hot_tags = hot_terms(tag_counter, max(8, len(recent) // 30), 5)
-    hot_fillers = hot_terms(filler_counter, max(10, len(recent) // 25), 8)
-    hot_objects = hot_terms(object_counter, max(8, len(recent) // 35), 8)
+    def hot_by_pct(counter: Counter, threshold: float, limit: int) -> List[str]:
+        min_count = max(3, int(n * threshold))
+        return [t for t, c in counter.most_common(limit) if c >= min_count]
 
-    hot_reading_phrases = hot_terms(reading_phrase_counter, max(3, len(recent) // 60), 6)
+    hot_openings = hot_by_pct(opening_counter, pct_threshold, 8)
+    hot_tags = hot_by_pct(tag_counter, 0.04, 5)
+    hot_fillers = hot_by_pct(filler_counter, 0.03, 8)
+    hot_objects = hot_by_pct(object_counter, 0.025, 8)
+    hot_reading_phrases = hot_by_pct(reading_phrase_counter, 0.015, 6)
 
-    if not any((hot_openings, hot_tags, hot_fillers, hot_objects, hot_reading_phrases)):
+    all_tag_names = [t.strip("[]") for t in TAG_DEFINITIONS.keys()]
+    tagged_count = sum(1 for item in texts[-5000:] if re.search(r"\[", item.get("text", "")))
+    if tagged_count > 50:
+        global_tag_counter = Counter()
+        for item in texts[-5000:]:
+            for tag in re.findall(r"\[([^\]]+)\]", item.get("text", "")):
+                global_tag_counter[tag] += 1
+        cold_tags = [
+            f"[{t}]" for t in all_tag_names
+            if global_tag_counter.get(t, 0) < max(2, tagged_count // 50)
+        ]
+    else:
+        cold_tags = []
+
+    if not any((hot_openings, hot_tags, hot_fillers, hot_objects, hot_reading_phrases, cold_tags)):
         return ""
 
     sections = []
@@ -3422,6 +3546,8 @@ def build_frequency_suppression_hint(
         sections.append(f"- 最近常见开头片段: {', '.join(hot_openings)}。本 batch 尽量换开头，不要照搬这些开头。")
     if hot_tags:
         sections.append(f"- 最近高频标签: {', '.join(f'[{t}]' for t in hot_tags)}。除非情绪强匹配，否则优先换其它允许标签或减少标签数。")
+    if cold_tags:
+        sections.append(f"- 低频标签（如适合场景/情绪可多用）: {', '.join(cold_tags)}。")
     if hot_fillers:
         sections.append(f"- 最近高频口头禅: {', '.join(hot_fillers)}。本 batch 最多少量使用，换成别的自然口语。")
     if hot_objects:
@@ -3484,9 +3610,9 @@ def _is_complete_for_asr(text: str) -> bool:
 _LENGTH_MIN_TAGS = {
     "ultra_short": 0,
     "short": 0,
-    "medium": 0,
-    "long": 0,
-    "very_long": 0,
+    "medium": 1,
+    "long": 1,
+    "very_long": 1,
 }
 
 _PRESCHOOL_MARKERS_RE = re.compile(
@@ -3583,6 +3709,8 @@ def quality_filter(
         valid_lang_types = {"pure_cn", "pure_en", "cn_mostly", "en_mostly", "frequent_mix"}
         if item.get("lang_type") not in valid_lang_types:
             continue
+        if not _validate_language_content(item, text):
+            continue
 
         # Reject texts with invalid (non-existent) tags
         invalid_tags = _find_invalid_tags(text)
@@ -3671,36 +3799,93 @@ def _age_tier_targets(config: GenConfig, total: int) -> Dict[str, int]:
     return counts
 
 
-def _accept_refill_by_age_quota(
+def _largest_remainder_targets(distribution: Dict[str, float], total: int) -> Dict[str, int]:
+    keys = list(distribution.keys())
+    weights = [distribution[k] for k in keys]
+    weight_sum = sum(weights) or 1.0
+    raw = [total * w / weight_sum for w in weights]
+    counts = {k: int(r) for k, r in zip(keys, raw)}
+    remainder = total - sum(counts.values())
+    if remainder > 0:
+        fractions = sorted(
+            ((raw[i] - int(raw[i]), keys[i]) for i in range(len(keys))),
+            reverse=True,
+        )
+        for _, key in fractions:
+            if remainder <= 0:
+                break
+            counts[key] += 1
+            remainder -= 1
+    return counts
+
+
+def _scenario_targets(config: GenConfig, total: int) -> Dict[str, int]:
+    regular = {
+        key: config.scenario_distribution.get(key, 1.0)
+        for key, scenario in SCENARIOS.items()
+        if not scenario.get("is_stress_test", False)
+    }
+    regular_total = max(0, total - int(total * config.stress_test_ratio))
+    targets = _largest_remainder_targets(regular, regular_total)
+    stress_keys = [key for key, scenario in SCENARIOS.items() if scenario.get("is_stress_test", False)]
+    if stress_keys:
+        stress_targets = _largest_remainder_targets(
+            {key: 1.0 for key in stress_keys},
+            total - sum(targets.values()),
+        )
+        targets.update(stress_targets)
+    return targets
+
+
+def _accept_refill_by_distribution_quota(
     results: List[Dict],
     texts: List[Dict],
     config: GenConfig,
     target: int,
 ) -> List[Dict]:
-    """Prefer candidates that fill under-represented age tiers."""
+    """Prefer candidates that fill under-represented generation dimensions."""
     if not results:
         return []
     remaining = target - len(texts)
     if remaining <= 0:
         return []
 
-    tier_targets = _age_tier_targets(config, target)
-    tier_counts = Counter(item.get("age_tier") for item in texts)
+    targets_by_dim = {
+        "age_tier": _age_tier_targets(config, target),
+        "lang_type": _largest_remainder_targets(config.lang_mix_distribution, target),
+        "length_type": _largest_remainder_targets(config.length_distribution, target),
+        "scenario": _scenario_targets(config, target),
+    }
+
+    def dim_value(item: Dict, dim: str) -> str:
+        if dim == "scenario":
+            return item.get("scenario") or item.get("scenario_key") or ""
+        return item.get(dim) or ""
+
+    counts_by_dim = {
+        dim: Counter(dim_value(item, dim) for item in texts)
+        for dim in targets_by_dim
+    }
     accepted: List[Dict] = []
     pool = list(results)
 
     while pool and len(accepted) < remaining:
-        def priority(idx: int) -> Tuple[int, int]:
-            tier = pool[idx].get("age_tier", "")
-            shortfall = tier_targets.get(tier, 0) - tier_counts.get(tier, 0)
-            return (shortfall, -idx)
+        def priority(idx: int) -> Tuple[int, int, int, int, int]:
+            item = pool[idx]
+            scores = []
+            for dim, dim_targets in targets_by_dim.items():
+                value = dim_value(item, dim)
+                shortfall = dim_targets.get(value, 0) - counts_by_dim[dim].get(value, 0)
+                scores.append(shortfall)
+            return (sum(scores), scores[1], scores[2], scores[3], -idx)
 
         best_idx = max(range(len(pool)), key=priority)
         item = pool.pop(best_idx)
         accepted.append(item)
-        tier = item.get("age_tier")
-        if tier:
-            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        for dim in targets_by_dim:
+            value = dim_value(item, dim)
+            if value:
+                counts_by_dim[dim][value] = counts_by_dim[dim].get(value, 0) + 1
 
     return accepted
 
@@ -3799,7 +3984,7 @@ def refill_to_target(
                         )
                         skipped_duplicates += skipped
                         if results:
-                            accepted = _accept_refill_by_age_quota(
+                            accepted = _accept_refill_by_distribution_quota(
                                 results, texts, config, target
                             )
                             texts.extend(accepted)
@@ -3920,13 +4105,85 @@ def analyze_emotion_tag_alignment(texts: List[Dict]) -> Dict:
 
 
 def analyze_language(texts: List[Dict]) -> Dict:
-    stats = {"by_declared": {}, "by_actual": {}}
+    stats = {"by_declared": {}, "by_actual": {}, "content_mismatch": 0}
     for item in texts:
         lang_type = item.get("lang_type", "unknown")
         language = item.get("language", "unknown")
         stats["by_declared"][lang_type] = stats["by_declared"].get(lang_type, 0) + 1
         stats["by_actual"][language] = stats["by_actual"].get(language, 0) + 1
+        if not _validate_language_content(item):
+            stats["content_mismatch"] += 1
     return stats
+
+
+def ensure_text_ids(texts: List[Dict]) -> None:
+    """Attach stable ids so generation, clone sidecars, and eval records can align."""
+    for item in texts:
+        if item.get("id"):
+            continue
+        identity = {
+            "text": item.get("text", ""),
+            "lang_type": item.get("lang_type"),
+            "length_type": item.get("length_type"),
+            "scenario": item.get("scenario") or item.get("scenario_key"),
+            "subscene": item.get("subscene"),
+            "task_id": item.get("task_id"),
+        }
+        digest = hashlib.md5(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        item["id"] = f"gen_{digest}"
+
+
+def generation_quality_report(texts: List[Dict], config: Optional[GenConfig] = None) -> Dict:
+    """Build lightweight QA stats for generated clone text JSONL."""
+    total = len(texts)
+    tag_stats = analyze_tags(texts)
+    lang_stats = analyze_language(texts)
+    report = {
+        "total": total,
+        "by_length": dict(Counter(t.get("length_type", "unknown") for t in texts)),
+        "by_lang_type": dict(Counter(t.get("lang_type", "unknown") for t in texts)),
+        "by_language": dict(Counter(t.get("language", "unknown") for t in texts)),
+        "by_age_tier": dict(Counter(t.get("age_tier", "unknown") for t in texts)),
+        "by_scenario": dict(Counter(t.get("scenario") or t.get("scenario_key") or "unknown" for t in texts)),
+        "tag_coverage": tag_stats.get("tag_coverage", 0.0),
+        "avg_tags_per_text": tag_stats.get("avg_tags_per_text", 0.0),
+        "empty_text_tn": sum(1 for t in texts if not t.get("text_tn")),
+        "language_content_mismatch": lang_stats.get("content_mismatch", 0),
+        "warnings": [],
+    }
+    if config is not None and total < config.total_target:
+        report["warnings"].append(f"below_target:{total}/{config.total_target}")
+    if total and report["empty_text_tn"] / total > 0.005:
+        report["warnings"].append(f"text_tn_empty_rate:{report['empty_text_tn'] / total:.2%}")
+    if total and report["language_content_mismatch"] / total > 0.01:
+        report["warnings"].append(
+            f"language_content_mismatch_rate:{report['language_content_mismatch'] / total:.2%}"
+        )
+    if report["tag_coverage"] < 0.20:
+        report["warnings"].append(f"low_tag_coverage:{report['tag_coverage']:.2%}")
+    return report
+
+
+def print_generation_quality_report(report: Dict) -> None:
+    print("\n=== Generation QA ===")
+    print(f"Total: {report['total']}")
+    print(f"Length: {report['by_length']}")
+    print(f"Lang type: {report['by_lang_type']}")
+    print(f"Language: {report['by_language']}")
+    print(f"Age: {report['by_age_tier']}")
+    print(f"Scenario: {report['by_scenario']}")
+    print(
+        f"Tags: coverage={report['tag_coverage'] * 100:.1f}% "
+        f"avg={report['avg_tags_per_text']:.2f}"
+    )
+    print(f"Empty text_tn: {report['empty_text_tn']}")
+    print(f"Language content mismatch: {report['language_content_mismatch']}")
+    if report["warnings"]:
+        print(f"Warnings: {', '.join(report['warnings'])}")
+    else:
+        print("Warnings: none")
 
 
 # ---------------------------------------------------------------------------
@@ -3957,6 +4214,70 @@ def load_checkpoint(path: str) -> List[Dict]:
     return texts
 
 
+def load_task_status(path: str) -> Dict[str, Dict]:
+    """Load per-task generation status used for reliable resume."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def save_task_status(status: Dict[str, Dict], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(status, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def is_task_complete(record: Optional[Dict], batch_size: int) -> bool:
+    """Treat only healthy batches as complete; partial/empty batches can be retried."""
+    if not record or record.get("status") != "completed":
+        return False
+    raw_count = int(record.get("raw_count") or 0)
+    accepted_count = int(record.get("accepted_count") or 0)
+    min_accepted = max(1, min(batch_size, (batch_size + 1) // 2))
+    return raw_count >= batch_size and accepted_count >= min_accepted
+
+
+def update_task_status(
+    status: Dict[str, Dict],
+    task: Dict,
+    state: str,
+    raw_count: int = 0,
+    accepted_count: int = 0,
+    skipped_duplicates: int = 0,
+    error: Optional[str] = None,
+) -> None:
+    task_id = str(task["task_id"])
+    prev = status.get(task_id, {})
+    attempts = int(prev.get("attempts") or 0) + 1
+    record = {
+        "task_id": task["task_id"],
+        "status": state,
+        "attempts": attempts,
+        "raw_count": raw_count,
+        "accepted_count": accepted_count,
+        "skipped_duplicates": skipped_duplicates,
+        "scenario_key": task.get("scenario_key"),
+        "subscene": task.get("subscene"),
+        "length_key": task.get("length_key"),
+        "lang_key": task.get("lang_key"),
+        "emotion": task.get("emotion"),
+        "age_tier": task.get("age_tier"),
+    }
+    if error:
+        record["error"] = error[:500]
+    status[task_id] = record
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3965,33 +4286,36 @@ def main():
     config = apply_config_from_env(GenConfig())
     os.makedirs(config.output_dir, exist_ok=True)
 
-    api_key = (
-        config.api_key
-        or os.environ.get("LLM_API_KEY")
-        or os.environ.get("DEEPSEEK_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-    )
-    if not api_key:
-        print("=" * 60)
-        print("ERROR: API key is not set.")
-        print(f"Copy {_ENV_FILE.name}.example to {_ENV_FILE.name} and set LLM_API_KEY.")
-        print("=" * 60)
-        sys.exit(1)
+    resolved_model, api_key, resolved_base_url = resolve_llm_credentials(config)
+    config.model = resolved_model
+    config.api_key = api_key
+    config.base_url = resolved_base_url
 
     output_jsonl = os.path.join(config.output_dir, "llm_children_v3.jsonl")
     checkpoint_path = os.path.join(config.output_dir, ".checkpoint_v3.jsonl")
+    task_status_path = os.path.join(config.output_dir, ".task_status_v3.json")
 
     all_texts = load_checkpoint(checkpoint_path)
     print(f"Loaded {len(all_texts)} existing texts from checkpoint")
     seen_normalized, duplicate_context_index = build_duplicate_index(all_texts)
 
-    tasks = generate_task_list(config)
+    task_config = replace(
+        config,
+        total_target=max(config.total_target, int(config.total_target * config.oversample_ratio)),
+    )
+    tasks = generate_task_list(task_config)
+    task_status = load_task_status(task_status_path)
     total_tasks = len(tasks)
     print(f"Total tasks: {total_tasks} (batch_size={config.batch_size}, target={config.total_target})")
     print(f"Model: {config.model}")
     print(f"Same-context duplicate threshold: {config.same_context_dup_threshold}")
+    print(f"Oversample ratio: {config.oversample_ratio:.2f}")
 
-    completed_task_ids = {t.get("task_id", -1) for t in all_texts}
+    completed_task_ids = {
+        int(task_id)
+        for task_id, rec in task_status.items()
+        if is_task_complete(rec, config.batch_size)
+    }
     pending_tasks = [t for t in tasks if t["task_id"] not in completed_task_ids]
     print(f"Pending tasks: {len(pending_tasks)}")
 
@@ -4028,6 +4352,7 @@ def main():
                     break
                 try:
                     results = future.result(timeout=120)
+                    raw_count = len(results or [])
                     if results:
                         results, skipped = filter_incremental_duplicates(
                             results,
@@ -4037,11 +4362,21 @@ def main():
                         )
                         skipped_duplicates += skipped
                         all_texts.extend(results)
+                        update_task_status(
+                            task_status,
+                            task,
+                            "completed",
+                            raw_count=raw_count,
+                            accepted_count=len(results),
+                            skipped_duplicates=skipped,
+                        )
                         completed += 1
                     else:
+                        update_task_status(task_status, task, "empty")
                         failed += 1
                 except Exception as e:
                     print(f"Task {task['task_id']} failed: {e}")
+                    update_task_status(task_status, task, "failed", error=str(e))
                     failed += 1
 
                 if (completed + failed) % 10 == 0:
@@ -4050,10 +4385,12 @@ def main():
                         f"total={len(all_texts)}, skipped_duplicates={skipped_duplicates}"
                     )
                     save_checkpoint(all_texts, checkpoint_path)
+                    save_task_status(task_status, task_status_path)
 
                 submit_next_task()
 
         save_checkpoint(all_texts, checkpoint_path)
+        save_task_status(task_status, task_status_path)
         if skipped_duplicates:
             print(f"Skipped {skipped_duplicates} near-duplicate texts before checkpointing")
 
@@ -4089,6 +4426,8 @@ def main():
     if length_mismatches:
         print(f"Length mismatches (warned, not filtered): {length_mismatches}")
 
+    ensure_text_ids(all_texts)
+    print_generation_quality_report(generation_quality_report(all_texts, config))
     save_checkpoint(all_texts, output_jsonl)
 
     # Statistics

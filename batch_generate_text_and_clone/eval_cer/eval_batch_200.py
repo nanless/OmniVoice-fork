@@ -196,6 +196,7 @@ TAG_TO_PARTICLE = {
     "[question-oh]": "哦",
     "[question-ei]": "诶",
     "[question-yi]": "咦",
+    "[question-en]": "嗯",
     "[surprise-ah]": "啊",
     "[surprise-oh]": "哦",
     "[surprise-wa]": "哇",
