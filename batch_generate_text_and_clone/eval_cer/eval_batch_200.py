@@ -420,17 +420,17 @@ def normalize_chinese_money(text: str) -> str:
 
 def normalize_units(text: str) -> str:
     text = re.sub(
-        r'\b(?:kilometers?|kms?)\s*(?:per|/)\s*(?:hour|hr|h)\b',
+        r'(?:kilometers?|kms?)\s*(?:per|/)\s*(?:hour|hr|h)\b',
         'kmh',
         text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(r'\bkm/h\b', 'kmh', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bcentimeters?\b', 'cm', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bcentimetres?\b', 'cm', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bmillimeters?\b', 'mm', text, flags=re.IGNORECASE)
-    text = re.sub(r'(\d)\s+kmh\b', r'\1kmh', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(\d+)\s*min(?:ute)?s?\b', r'\1min', text, flags=re.IGNORECASE)
+    text = re.sub(r'km/h\b', 'kmh', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<![a-zA-Z])centimeters?\b', 'cm', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<![a-zA-Z])centimetres?\b', 'cm', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<![a-zA-Z])millimeters?\b', 'mm', text, flags=re.IGNORECASE)
+    text = re.sub(r'(\d)\s*kmh\b', r'\1kmh', text, flags=re.IGNORECASE)
+    text = re.sub(r'(\d+)\s*min(?:ute)?s?\b', r'\1min', text, flags=re.IGNORECASE)
     return text
 
 
@@ -528,19 +528,181 @@ def normalize_numbers(text: str) -> str:
     return text
 
 
-def manual_itn_preprocess(text: str, keep_tag: bool = False) -> str:
-    """Stage-1 ITN (LLM input and manual baseline).
-    
+# ── Tag → canonical spoken form (ref only) ──────────────────────────
+TAG_CANONICAL = {
+    "[laughter]": "哈哈",
+    "[sigh]": "哎",
+    "[question-ah]": "啊",
+    "[question-oh]": "哦",
+    "[question-ei]": "诶",
+    "[question-yi]": "咦",
+    "[question-en]": "嗯",
+    "[surprise-ah]": "啊",
+    "[surprise-oh]": "哦",
+    "[surprise-wa]": "哇",
+    "[surprise-yo]": "哟",
+    "[dissatisfaction-hnn]": "嗯",
+    "[confirmation-en]": "嗯",
+}
+
+
+def replace_tags_with_canonical(text: str) -> str:
+    """Replace OmniVoice tags with canonical spoken form (ref side only)."""
+    def _repl(m):
+        return TAG_CANONICAL.get(m.group(), "")
+    text = TAG_PATTERN.sub(_repl, text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# ── Spoken symbol normalization (both ref and hypo) ──────────────────
+_SPOKEN_SYMBOLS_ZH = [
+    (r'²', '平方'),
+    (r'³', '立方'),
+    (r'∠', '角'),
+    (r'△', '三角形'),
+    (r'√', '根号'),
+    (r'π', '派'),
+    (r'(\d)\s*°(?!\s*[cCfF])', r'\1度'),
+    (r'≥', '大于等于'),
+    (r'≤', '小于等于'),
+    (r'≈', '约等于'),
+    (r'≠', '不等于'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*\+\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '加'),
+    (r'(?<=[\d\u4e00-\u9fffa-zA-Z])\s*[=＝]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '等于'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*[-−]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '减'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*[×✕]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '乘'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*[÷]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '除以'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*[>＞]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '大于'),
+    (r'(?<=[\d\u4e00-\u9fff])\s*[<＜]\s*(?=[\d\u4e00-\u9fffa-zA-Z])', '小于'),
+]
+
+_SPOKEN_SYMBOLS_EN = [
+    (r'\bequals?\b', 'equals', re.IGNORECASE),
+    (r'\bplus\b', 'plus', re.IGNORECASE),
+    (r'\bminus\b', 'minus', re.IGNORECASE),
+    (r'\btimes\b', 'times', re.IGNORECASE),
+    (r'\bdivided\s+by\b', 'divided by', re.IGNORECASE),
+    (r'\bgreater\s+than\b', 'greater than', re.IGNORECASE),
+    (r'\bless\s+than\b', 'less than', re.IGNORECASE),
+    (r'\bdegrees?\b', 'degrees', re.IGNORECASE),
+    (r'\bsquared\b', 'squared', re.IGNORECASE),
+    (r'\bcubed\b', 'cubed', re.IGNORECASE),
+]
+
+
+def normalize_spoken_symbols(text: str) -> str:
+    """Convert math/spoken symbols to text form before punct stripping."""
+    for pattern, repl, *flags in _SPOKEN_SYMBOLS_ZH:
+        f = flags[0] if flags else 0
+        text = re.sub(pattern, repl, text, flags=f)
+    for pattern, repl, *flags in _SPOKEN_SYMBOLS_EN:
+        f = flags[0] if flags else 0
+        text = re.sub(pattern, repl, text, flags=f)
+    return text
+
+
+# ── Multi-variant particle normalization (both ref and hypo) ─────────
+_PARTICLE_VARIANTS = [
+    ('哈哈', [r'哈哈哈+', r'呵呵呵*', r'嘿嘿嘿*', r'嘻嘻嘻*', r'哈哈']),
+    ('哎', [r'唉', r'嗳']),
+    ('嗯', [r'嗯嗯+', r'嗯哼', r'唔']),
+    ('哇', [r'哇哦', r'哇噢', r'哇塞']),
+    ('诶', [r'欸']),
+    ('咦', [r'噫']),
+    ('哟', [r'唷', r'哟呵']),
+]
+
+_PARTICLE_VARIANT_RES = []
+for canonical, variants in _PARTICLE_VARIANTS:
+    for v in variants:
+        _PARTICLE_VARIANT_RES.append((re.compile(v), canonical))
+
+
+def normalize_particle_variants(text: str) -> str:
+    """Normalize ASR particle variants to canonical form."""
+    for pattern, canonical in _PARTICLE_VARIANT_RES:
+        text = pattern.sub(canonical, text)
+    return text
+
+
+# ── Sentence-final particle normalization (both) ─────────────────────
+_FINAL_PARTICLE_MAP = {
+    '啦': '了',
+    '嘛': '吗',
+    '呀': '啊',
+}
+_FINAL_PARTICLE_RE = re.compile(
+    r'(' + '|'.join(re.escape(k) for k in _FINAL_PARTICLE_MAP) + r')'
+)
+
+
+def normalize_final_particles(text: str) -> str:
+    """Normalize particle variants everywhere: 啦→了, 嘛→吗, 呀→啊."""
+    return _FINAL_PARTICLE_RE.sub(lambda m: _FINAL_PARTICLE_MAP[m.group(1)], text)
+
+
+# ── English-Chinese exclamation equivalents (both) ───────────────────
+_EXCLAMATION_NORMS = [
+    (re.compile(r'(?<![a-zA-Z])uh(?![a-zA-Z])', re.IGNORECASE), '嗯'),
+    (re.compile(r'(?<![a-zA-Z])um+(?![a-zA-Z])', re.IGNORECASE), '嗯'),
+    (re.compile(r'(?<![a-zA-Z])hmm+(?![a-zA-Z])', re.IGNORECASE), '嗯'),
+    (re.compile(r'(?<![a-zA-Z])wow(?![a-zA-Z])', re.IGNORECASE), '哇'),
+    (re.compile(r'(?<![a-zA-Z])whoa(?![a-zA-Z])', re.IGNORECASE), '哇'),
+    (re.compile(r'(?<![a-zA-Z])oh(?![a-zA-Z])', re.IGNORECASE), '哦'),
+    (re.compile(r'(?<![a-zA-Z])ah(?![a-zA-Z])', re.IGNORECASE), '啊'),
+    (re.compile(r'(?<![a-zA-Z])huh(?![a-zA-Z])', re.IGNORECASE), '啊'),
+    (re.compile(r'(?<![a-zA-Z])yo(?![a-zA-Z])', re.IGNORECASE), '哟'),
+    (re.compile(r'(?<![a-zA-Z])uh-huh(?![a-zA-Z])', re.IGNORECASE), '嗯'),
+]
+
+
+def normalize_exclamation_equivalents(text: str) -> str:
+    """Normalize English exclamation words to Chinese equivalents."""
+    for pattern, canonical in _EXCLAMATION_NORMS:
+        text = pattern.sub(canonical, text)
+    return text
+
+
+# ── Extended unit normalization ──────────────────────────────────────
+def normalize_titles(text: str) -> str:
+    text = re.sub(r'\b[Mm]iss\b', 'ms', text)
+    text = re.sub(r'\b[Mm]ister\b', 'mr', text)
+    text = re.sub(r'\bMs\.?\b', 'ms', text)
+    text = re.sub(r'\bMr\.?\b', 'mr', text)
+    text = re.sub(r'\bMrs\.?\b', 'mrs', text)
+    return text
+
+
+# ── Improved manual_itn pipeline ─────────────────────────────────────
+def manual_itn_preprocess(text: str, keep_tag: bool = False, is_ref: bool = False) -> str:
+    """Stage-1 ITN with full normalization pipeline.
+
     Args:
         keep_tag: True保留标签用于大模型ITN，False删除标签用于CER计算
+        is_ref: True=reference text (tags→canonical), False=hypothesis
     """
-    processed = text if keep_tag else remove_tags(text)
-    return finalize_cer_text(strip_punctuation(normalize_numbers(processed)).lower())
+    if keep_tag:
+        processed = text
+    elif is_ref:
+        processed = replace_tags_with_canonical(text)
+    else:
+        processed = remove_tags(text)
+    processed = normalize_spoken_symbols(processed)
+    processed = normalize_numbers(processed)
+    processed = normalize_titles(processed)
+    processed = strip_punctuation(processed).lower()
+    processed = normalize_particle_variants(processed)
+    processed = normalize_final_particles(processed)
+    processed = normalize_exclamation_equivalents(processed)
+    processed = re.sub(rf'({_CJK_CHAR})\s+({_CJK_CHAR})', r'\1\2', processed)
+    processed = re.sub(rf'({_CJK_CHAR})\s+([a-zA-Z0-9])', r'\1\2', processed)
+    processed = re.sub(rf'([a-zA-Z0-9])\s+({_CJK_CHAR})', r'\1\2', processed)
+    return finalize_cer_text(processed)
 
 
-def manual_itn(text: str) -> str:
+def manual_itn(text: str, is_ref: bool = False) -> str:
     """Stage-1 ITN for CER baseline."""
-    return manual_itn_preprocess(text)
+    return manual_itn_preprocess(text, is_ref=is_ref)
 
 
 _CJK_CHAR = r'[\u4e00-\u9fff]'
@@ -621,11 +783,11 @@ def build_eval_item(wav_path: Path, json_path: Path, hypo_raw: str) -> dict:
     meta = load_json(json_path)
     truth_raw = meta.get("gen_text", "")
 
-    ref_manual = manual_itn(truth_raw)
-    hyp_manual = manual_itn(hypo_raw)
+    ref_manual = manual_itn(truth_raw, is_ref=True)
+    hyp_manual = manual_itn(hypo_raw, is_ref=False)
     # 保留标签版本，用于大模型ITN输入
-    ref_manual_prep = manual_itn_preprocess(truth_raw, keep_tag=True)
-    hyp_manual_prep = manual_itn_preprocess(hypo_raw, keep_tag=False)
+    ref_manual_prep = manual_itn_preprocess(truth_raw, keep_tag=True, is_ref=True)
+    hyp_manual_prep = manual_itn_preprocess(hypo_raw, keep_tag=False, is_ref=False)
     manual_cer, csub, cins, cdel, cnum = calc_cer(ref_manual, hyp_manual)
 
     return {

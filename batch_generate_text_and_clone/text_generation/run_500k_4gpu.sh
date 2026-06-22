@@ -29,7 +29,7 @@ GEN_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 TARGET=500000
 BATCH_SIZE=10
-MAX_WORKERS=40
+MAX_WORKERS=80
 SEED=12345
 
 # ── 参数解析 ──────────────────────────────────────────
