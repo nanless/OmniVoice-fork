@@ -1,192 +1,94 @@
-# 克隆语音 CER 评测（eval_cer）
+# 确定性 CER v4
 
-对 `batch_cloned_voices/` 下的克隆音频做 **全段 ASR → 两阶段 ITN → 字级 CER** 评测，对比 Manual ITN 与 LLM ITN 效果，衡量克隆内容是否「读对了」。
+生产路径固定为：`完整克隆音频 → Qwen3-ASR → ref/hyp 各自规则 TN → 字级 CER`。这里不调用 LLM，不读取 LLM endpoint/cache，也不会同时查看 ref 和 hyp 后挑更低的分数。
 
-> 音色相似度请用 **[eval_sim](../eval_sim/README.md)**，自然度请用 **[eval_mos](../eval_mos/README.md)**；本目录只评文本正确性。
+## 指标与缓存契约
 
-## 目录
+- `cer_metric`: `deterministic_char_cer`
+- `eval_schema_version`: `4`
+- `cer_score_version`: `4`
+- `normalization_profile`: `safe`
+- `normalization_version`: `4`
+- 每条 `.eval.json` 绑定 TN 源码指纹、参考文本及其语言上下文、ASR hypothesis、WAV 签名、ASR 模型文件指纹和 decode 配置指纹。
+- canonical 字段只有 `cer`、`ref_normalized`、`hypo_normalized`、编辑次数和 `reference_chars`；旧 `manual_cer`、`llm_cer` 不参与报告和筛选。
 
-```
-eval_cer/
-├── README.md              # 本文档
-├── .env                   # LLM ITN API（勿提交 Git）
-├── eval_batch_200.py      # 固定 N 条样本、可复现对比（推荐日常跑分）
-├── eval_cloned.py         # 全库扫描、逐条写 .eval.json
-└── eval_sample_{N}.json   # 首次运行 eval_batch_200 时自动生成
-```
+任一 WAV、clone metadata、参考语言、TN 规则、ASR 模型或 decode 配置变化，旧 CER 都会失效。TN-only 变化时仍可复用来源与当前模型/decode/WAV 完全一致的原始 ASR hypothesis；强制中文解码得到的旧 hypothesis 不能冒充当前自动语言解码结果。
 
-## 环境
+## TN v4 的顺序与边界
 
-```bash
-conda activate omnivoice
-cd batch_generate_text_and_clone/eval_cer
-```
+`cer_normalization.py` 提供 `strict` 和 `safe`。生产筛选使用 `safe`，顺序如下：
 
-| 依赖 | 说明 |
-|------|------|
-| Qwen3-ASR | 本地默认 `~/.cache/huggingface/hub/Qwen3-ASR-1.7B-local` |
-| jiwer | 字级 CER |
-| LLM ITN API | `eval_cer/.env` 中 `ITN_LLM_*` |
-| torch / torchaudio | ASR 推理 |
+1. 只解码完整且带分号的 HTML entity；未知、非法或控制字符 entity 保留为 `HTML` 证据。
+2. 统一 NFC、全半角、大小写、空白和不承载语义的标点。
+3. 仅 reference 展开白名单 speech tag：显式 `language` 优先，其次 `lang_type`；旧 sidecar 两者都缺失时，仅按 CJK/拉丁字符做确定性回退。判定值和来源都写入 normalization context。hypothesis 从不读取 reference 或其 metadata，未知方括号 tag 保留为 `TAG` 证据。
+4. 按明确上下文依次处理日期、时间、百分比、金额、数量/单位、分数、序数、号码和普通数字。
+5. 用类型 token 保留语义：`NUM`、`DIGITS`、`ORDINAL`、`FRACTION`、`PERCENT`、`DATE`、`TIME`、`MONEY`、`QTY`、`TAG`、`HTML`。
 
-### `.env` 示例
+已覆盖的确定性形式包括中文万/亿大数、合法千分位、英文 cardinal/decimal、显式百分比和单位、合法日期、带明确格式/时段的时间、中英序数、阿拉伯/中文/Unicode/英文分数，以及带“号码/电话/区号/phone number/area code”标签的逐位数字。
 
-```bash
-ITN_LLM_MODEL=deepseek-v4-flash
-ITN_LLM_API_KEY=sk-...
-ITN_LLM_BASE_URL=https://your-api/v1
-```
+这些差异不会被抹掉：
 
-也支持 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` 作为回退。
+- `80` vs `80%`，`12` vs `12th`，`1/2` vs `50%`；
+- `0012` vs `12`，`one two` vs `twelve`；
+- filler、语气词、儿化、重复/自修正、同音词、人名、contraction；
+- `03/04`、`三点一四`、`有一点希望`、`给我两点建议`、比分/ratio/version、非法时间/序数等歧义或畸形写法。
 
-## 评测流程
-
-```mermaid
-flowchart TD
-  WAV[克隆 wav + sidecar json] --> ASR[Qwen3-ASR 全段识别 无 VAD]
-  ASR --> M1[Stage 1 Manual ITN]
-  M1 --> CER1[Manual CER 基线]
-  M1 --> M2[Stage 2 LLM ITN]
-  M2 --> PP[后处理: ref 锁定 + 空格清理 + CER 回退]
-  PP --> CER2[LLM CER]
-  CER1 --> RPT[summary / details / comparison]
-  CER2 --> RPT
-```
-
-### Stage 1 — Manual ITN
-
-对 ref（sidecar 的 `gen_text`）与 ASR 假设依次：
-
-1. 去掉 OmniVoice 非语言标签（`[laughter]` 等）
-2. 数字/单位/分数/中文数字等规则归一化（复用 `text_generation/llm_generate_texts.py` 中规则）
-3. 去标点、小写、合并多余空白（**保留词间空格**）
-
-### Stage 2 — LLM ITN
-
-- **输入**：Manual ITN 预处理后的 `ref_manual_prep` / `hypo_manual_prep`
-- **目的**：补 Manual 未覆盖的同音字、拼音、公式、中英混读对齐等
-- **后处理**（`llm_itn_postprocess`）：
-  - ref **固定为** `ref_manual`，不让 LLM 改参考文本
-  - 清理 CJK↔拉丁多余空格
-  - 若 `CER(ref, hyp_llm) > CER(ref, hyp_manual)`，回退到 Manual hyp
-
-### 指标
-
-- **字级 CER**（`jiwer.process_characters`），非词级 WER
-- 汇总 **Weighted CER**（按 ref 字符数加权）
-
-## 脚本对比
-
-| 脚本 | 适用场景 | 样本 | 输出位置 |
-|------|----------|------|----------|
-| `eval_batch_200.py` | 固定子集、迭代 ITN、对比 Manual/LLM | `--sample-size`（默认 200） | `batch_cloned_voices/eval_*_{N}.*` |
-| `eval_cloned.py` | 全库正式评测 | 所有 `text_*.wav` | `batch_cloned_voices/eval_*.*` + `text_*.eval.json` |
-
-两者共用 `eval_batch_200.py` 中的 ASR / ITN / 报告函数，流水线一致。
-
-## 快速开始
-
-### 固定 200 条（日常对比）
+## 自检
 
 ```bash
-# 首次：ASR + LLM（会生成 eval_sample_200.json）
-python eval_batch_200.py
-
-# 仅重跑 LLM（ASR 走缓存）
-python eval_batch_200.py --skip-asr --refresh-llm-cache
-
-# 500 条（seed=43，输出 eval_*_500.*）
-python eval_batch_200.py --sample-size 500
+python eval_cer/check_cer_normalization.py
+python eval_cer/check_cer_contract.py
 ```
 
-### 全库评测
+第一个是规则与反例规范；第二个验证语言 metadata 变化会让 CER 失效，且旧 ASR decode 不能被复用。
+
+对一个 clone 根目录做只读全量 TN 审计（检查 metadata 完整性、空输出、幂等性和 token 分布）：
 
 ```bash
-python eval_cloned.py
-
-python eval_cloned.py --skip-asr --refresh-llm-cache
-
-python eval_cloned.py --skip-llm    # 只算 Manual ITN，不调 LLM API
+python eval_cer/audit_cer_normalization_corpus.py --root /path/to/clones
 ```
 
-## CLI 参数
+## 全量评测
 
-### `eval_batch_200.py`
+```bash
+python eval_cer/eval_cloned.py \
+  --out-dir /path/to/raw_clone_round \
+  --batch-size 16 --skip-existing
+```
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--sample-size` | 200 | 固定样本数 |
-| `--seed` | 200→42, 500→43 | 创建样本列表时的 RNG seed |
-| `--skip-asr` | off | 读 `eval_asr_cache_{N}.json` |
-| `--skip-llm` | off | 跳过 LLM ITN |
-| `--llm-batch-size` | 10 | 每次 LLM 请求的 ref/hyp 对数 |
-| `--llm-concurrency` | 5 | 并行 LLM 请求数 |
-| `--refresh-llm-cache` | off | 忽略 LLM 缓存并重跑 |
+常用参数：
 
-### `eval_cloned.py`
+- `--skip-asr`：只使用模型、decode 和 WAV 签名均有效的 ASR cache/sidecar hypothesis。
+- `--refresh-asr-cache`：不复用缓存，全量重跑 ASR。
+- `--refresh-cer`：复用有效 ASR hypothesis，只按当前 TN 重算 CER。
+- `--skip-existing`：跳过当前有效的 v4 sidecar，但仍全量重建 canonical 报告。
+- `--allow-partial`：仅在明确接受部分 clone inventory 时使用；生产筛选不要开启。
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--out-dir` | `batch_cloned_voices/` | 克隆根目录 |
-| 其余 | 同上 | 与 batch 脚本相同 |
+固定样本：
 
-## 输出文件
+```bash
+python eval_cer/eval_batch_200.py --sample-size 200
+```
 
-### 固定样本（`eval_batch_200.py`，N=200/500/…）
+输出：
 
-| 文件 | 内容 |
-|------|------|
-| `eval_sample_{N}.json` | 固定 wav 路径列表（可复现） |
-| `eval_asr_cache_{N}.json` | wav → ASR 原文 |
-| `eval_llm_itn_cache_{N}.json` | wav → LLM ITN 结果 |
-| `eval_summary_{N}.json` | Weighted CER、details 列表 |
-| `eval_details_{N}_manual.txt` | Manual ITN 逐条明细 |
-| `eval_details_{N}_llm.txt` | LLM ITN 逐条明细 |
-| `eval_comparison_{N}.txt` | Manual vs LLM 对比 |
+- `text_*.eval.json`：权威逐条 sidecar；
+- `eval_cer_details.jsonl`：filter/prune 的 canonical 输入；
+- `eval_summary.json`、`eval_details.txt`：全量汇总和人工检查报告；
+- `eval_asr_cache.json` + `.meta.json`：绑定音频、模型和 decode 配置的 ASR cache。
 
-### 全库（`eval_cloned.py`）
+## 从 v2/v3 安全迁移
 
-| 文件 | 内容 |
-|------|------|
-| `eval_asr_cache.json` | 全库 ASR 缓存 |
-| `eval_llm_itn_cache.json` | 全库 LLM 缓存 |
-| `eval_summary.json` | 汇总 |
-| `eval_details_manual.txt` / `_llm.txt` / `eval_comparison.txt` | 文本报告 |
-| `{说话人}/text_XXX.eval.json` | 每条克隆的评测结果 |
+迁移只复用模型、decode、WAV 和原始文本身份都能证明仍然有效的 `asr_hypo`；旧 normalized/LLM 字段全部忽略。缺少 decode 指纹的旧结果会拒绝迁移，需要重新跑 ASR。
 
-### `.eval.json` 示例字段
+```bash
+# 默认只预览
+python eval_cer/migrate_cer_to_v4.py --out-dir /path/to/clones
 
-`gen_text`、`asr_hypo`、`ref_manual`、`hypo_manual`、`manual_cer`、（可选）`ref_llm`、`hypo_llm`、`llm_cer`。
+# 确认后原子写入
+python eval_cer/migrate_cer_to_v4.py --out-dir /path/to/clones --write
+```
 
-## 输入数据约定
+旧入口 `migrate_cer_v2_to_v3.py` 只保留为兼容 wrapper，实际同样生成 v4。
 
-- 扫描 `text_*.json`，排除 `*.eval.json` / `*.sim.json`
-- sidecar 需含 `gen_text` 作为评测参考
-- ASR 对 `text_*.wav` **全段识别，不使用 VAD**
-- 仅评测 `status=generated` 且 wav 存在的条目（`eval_cloned` 按 wav 存在性过滤）
-
-## 缓存注意事项
-
-1. **ASR 缓存必须与当前 wav 列表匹配**。`validate_asr_cache` 零命中会直接报错。
-2. 改 `--sample-size` 后应重跑 ASR，或删除旧 `eval_asr_cache_{N}.json`。
-3. 改 LLM 提示词：用 `--refresh-llm-cache`；只改后处理逻辑可 `--skip-asr` 且不 refresh LLM 缓存。
-4. LLM HTTP 429 会自动退避；可降低 `--llm-concurrency`。
-
-## 与 eval_sim / eval_mos 的区别
-
-| | eval_cer | eval_sim | eval_mos |
-|---|----------|----------|----------|
-| 评什么 | 读的内容对不对 | 音色像不像原说话人 | 听感自然度 |
-| 参考 | `gen_text` | `ref_audio` | 仅克隆 wav |
-| 指标 | CER ↓ | similarity ↑ | UTMOS ↑ |
-
-## 常见问题
-
-**CER 虚高？**  
-检查是否误用旧 ASR 缓存；确认 `gen_text` 与克隆 wav 对应。
-
-**只想快速看 Manual 基线？**  
-`python eval_cloned.py --skip-llm`
-
-**ASR 模型路径？**  
-修改 `eval_batch_200.py` 中 `QWEN3_ASR_LOCAL`。
+遗留 `compare_itn_batch_sizes.py` 和 `analyze_1000_samples.py` 已 fail-fast 禁用，不再发起 LLM ITN 或读取其评分作为生产依据。

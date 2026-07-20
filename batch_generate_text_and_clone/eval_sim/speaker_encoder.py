@@ -139,12 +139,21 @@ class SpeakerEncoder:
 
     @staticmethod
     def cosine_similarity(e1, e2) -> float:
-        if isinstance(e1, torch.Tensor):
-            e1 = e1.detach().cpu()
-        if isinstance(e2, torch.Tensor):
-            e2 = e2.detach().cpu()
-        score = torch.dot(e1, e2) / (torch.norm(e1) * torch.norm(e2))
-        return float((score.item() + 1.0) / 2.0)
+        """Return the raw cosine similarity in [-1, 1]."""
+        e1 = torch.as_tensor(e1).detach().cpu().float().flatten()
+        e2 = torch.as_tensor(e2).detach().cpu().float().flatten()
+        if e1.shape != e2.shape:
+            raise ValueError(f"Embedding shape mismatch: {tuple(e1.shape)} vs {tuple(e2.shape)}")
+
+        denominator = torch.linalg.vector_norm(e1) * torch.linalg.vector_norm(e2)
+        if not torch.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError("Cosine similarity is undefined for a zero or non-finite embedding")
+
+        score = torch.dot(e1, e2) / denominator
+        if not torch.isfinite(score):
+            raise ValueError("Cosine similarity is non-finite")
+        # Clamp only floating-point round-off beyond the mathematical cosine bounds.
+        return float(score.clamp(-1.0, 1.0).item())
 
     def compute_similarity(
         self, audio_path1: Union[str, Path], audio_path2: Union[str, Path]

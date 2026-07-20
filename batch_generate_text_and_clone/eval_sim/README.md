@@ -1,6 +1,6 @@
 # 克隆语音说话人相似度评测（eval_sim）
 
-用 **samresnet100**（voxblink2 说话人验证模型）计算 `voice_clone` 克隆音与 sidecar 中 `ref_audio` 原音的余弦相似度，归一化到 **[0, 1]**，衡量音色保留程度。
+用 **samresnet100**（voxblink2 说话人验证模型）计算 `voice_clone` 克隆音与 sidecar 中 `ref_audio` 原音的**原始余弦相似度 [-1, 1]**，衡量音色保留程度。
 
 > 文本正确性请用 **[eval_cer](../eval_cer/README.md)**，自然度请用 **[eval_mos](../eval_mos/README.md)**；本目录只评说话人相似度。
 
@@ -15,6 +15,7 @@ eval_sim/
 ├── eval_clone_similarity.py     # 主脚本：扫描克隆库、成对算相似度
 ├── speaker_encoder.py           # 模型加载 + embedding 提取
 ├── speaker_similarity.py          # embedding 磁盘缓存 + 相似度
+├── metric_contract.py           # raw cosine 结果 schema、版本与读取校验
 ├── verify_parity.py             # 与 wespeaker 对齐校验（开发用）
 ├── models/
 │   └── samresnet.py             # SimAM_ResNet100 + ASP（内嵌实现）
@@ -92,7 +93,7 @@ python eval_clone_similarity.py --gpu 0 --sample-size 200 --seed 42
 1. 读 `ref_audio`（原参考 wav）
 2. 读 `text_*.wav`（克隆 wav，16 kHz）
 3. 分别提 256 维 speaker embedding
-4. 算余弦相似度 → [0, 1]
+4. 算原始余弦相似度 → [-1, 1]
 
 同一 `ref_audio` 对应 10 条克隆时，embedding 缓存会复用 ref 向量，加速全库评测。
 
@@ -107,9 +108,12 @@ torchaudio.load(..., normalize=False)   # int16，勿用默认 float 归一化
   → Kaldi fbank × 2^15
   → CMN（逐 utterance 减均值）
   → SimAM_ResNet100_ASP
-cosine = dot(e1, e2) / (||e1|| * ||e2||)
-similarity = (cosine + 1) / 2
+similarity = dot(e1, e2) / (||e1|| * ||e2||)
 ```
+
+`similarity` 直接保存原始 cosine，不再执行 `(cosine + 1) / 2`。旧版无版本字段的
+结果是 `[0,1]` 归一化分数，不能与新版混用；其数学等价换算为
+`raw_cosine = 2 * legacy_similarity - 1`，生产结果建议直接重跑评测。
 
 ### 对齐校验
 
@@ -117,7 +121,7 @@ similarity = (cosine + 1) / 2
 
 ```bash
 /root/miniforge3/envs/3dspeaker/bin/python verify_parity.py
-# 8 对样本，embedding / similarity 差异应为 0
+# 8 对样本，embedding / raw cosine similarity 差异应为 0
 ```
 
 ## CLI（`eval_clone_similarity.py`）
@@ -147,12 +151,18 @@ similarity = (cosine + 1) / 2
 {
   "cloned_audio": ".../text_004.wav",
   "ref_audio": ".../original.wav",
-  "similarity": 0.823,
+  "similarity": 0.646,
+  "similarity_metric": "raw_cosine",
+  "score_version": 2,
+  "similarity_range": [-1.0, 1.0],
   "dataset": "BAAI-ChildMandarin41.25H_...",
   "gen_text": "...",
   "ref_text": "...",
   "speed": 0.94,
   "model_dir": ".../eval_sim/model",
+  "model_signature": {"config.yaml": {"size": 418, "mtime_ns": 0, "sha256": "..."}, "avg_model.pt": {"size": 123, "mtime_ns": 0, "sha256": "..."}},
+  "cloned_audio_signature": {"size": 123456, "mtime_ns": 0},
+  "ref_audio_signature": {"size": 234567, "mtime_ns": 0},
   "evaluated_at": "2026-05-27T15:25:03"
 }
 ```
@@ -172,13 +182,18 @@ sidecar（`voice_clone` 写入的 `text_*.json`）需含：
 | | eval_sim | eval_cer | eval_mos |
 |---|----------|----------|----------|
 | 对比对象 | 克隆 wav vs **原 ref wav** | ASR vs **gen_text** | 克隆 wav |
-| 指标 | similarity ∈ [0,1] | CER | UTMOS ∈ [1,5] |
+| 指标 | raw cosine similarity ∈ [-1,1] | CER | UTMOS ∈ [1,5] |
 | 含义 | 音色像不像 | 内容对不对 | 听感自然度 |
 
 ## 常见问题
 
 **相似度偏低但 CER 很好？**  
 克隆读了正确内容，但音色偏离参考说话人——需调 OmniVoice 克隆参数或 checkpoint。
+
+**升级后 `--skip-existing` 会怎样？**
+只复用 `similarity_metric=raw_cosine`、`score_version=2`，且模型、克隆音和参考音签名一致的成功 sidecar；
+旧版、损坏、失败、其他模型或输入文件已变化的结果会重算。聚合 details/summary 会从当前 sidecar 重建，
+不会把旧分数追加进新版结果。
 
 **能否评不同 checkpoint 的克隆？**  
 可以；sidecar 里 `model` 字段会写入报告，按 `--out-dir` 扫描即可。

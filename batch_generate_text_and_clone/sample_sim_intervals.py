@@ -27,38 +27,39 @@ DEFAULT_OUT_DIR = Path(
 )
 
 SIM_INTERVALS = [
+    (0.00, 0.20),
+    (0.20, 0.40),
+    (0.40, 0.50),
     (0.50, 0.60),
     (0.60, 0.70),
-    (0.70, 0.75),
-    (0.75, 0.80),
-    (0.80, 0.85),
-    (0.85, 0.90),
-    (0.90, 0.95),
-    (0.95, 1.00),
+    (0.70, 0.80),
+    (0.80, 0.90),
+    (0.90, 1.00),
 ]
 
 SIDECAR_SUFFIXES = [".eval.json", ".sim.json", ".mos.json"]
+
+EVAL_SIM_DIR = Path(__file__).resolve().parent / "eval_sim"
+sys.path.insert(0, str(EVAL_SIM_DIR))
+from metric_contract import SimilarityCollectionValidator, similarity_metadata  # noqa: E402
 
 
 def load_sim_data(sim_dir: Path) -> Dict[str, dict]:
     """Load SIM data from all eval_sim_details*.jsonl files, dedup by cloned_audio."""
     t0 = time.time()
-    seen = set()
-    data = {}
+    validator = SimilarityCollectionValidator()
     for fp in sorted(sim_dir.glob("eval_sim_details*.jsonl")):
         with open(fp, encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                wav = r.get("cloned_audio", "")
-                if wav and wav not in seen:
-                    seen.add(wav)
-                    data[wav] = r
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{fp}:{line_no}: invalid JSON: {exc}") from exc
+                validator.add(r, f"{fp}:{line_no}")
+    data = dict(validator.records)
     print(f"[SIM] loaded {len(data)} records in {time.time() - t0:.1f}s", file=sys.stderr)
     return data
 
@@ -133,7 +134,7 @@ def main():
             continue
 
         sampled = rng.sample(pairs, n)
-        interval_dir = output_root / f"sim_{lo:.2f}_{hi:.2f}".replace(".", "")
+        interval_dir = output_root / f"simraw_{lo:.2f}_{hi:.2f}".replace(".", "")
         print(f"[{lo:.2f}-{hi:.2f}] Sampling {n}/{len(pairs)} pairs → {interval_dir}/", file=sys.stderr)
 
         for i, (cloned_wav, rec) in enumerate(sampled, 1):
@@ -191,6 +192,7 @@ def main():
                 "pair_index": i,
                 "interval": f"[{lo:.2f}, {hi:.2f})",
                 "similarity": sim_val,
+                **similarity_metadata(),
                 "cloned_audio": str(cloned_wav),
                 "ref_audio": str(ref_audio),
                 "gen_text": rec.get("gen_text"),
@@ -198,6 +200,7 @@ def main():
                 "language": rec.get("language"),
                 "speed": rec.get("speed"),
                 "dataset": rec.get("dataset"),
+                "model_dir": rec.get("model_dir"),
             }
             write_meta(summary, pair_dir / "pair_info.json")
 

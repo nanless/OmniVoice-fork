@@ -28,6 +28,7 @@ def embedding_to_numpy(emb) -> np.ndarray:
 
 
 def cosine_similarity(e1, e2) -> float:
+    """Return unshifted, unscaled cosine similarity in [-1, 1]."""
     if isinstance(e1, np.ndarray):
         e1 = torch.from_numpy(e1)
     if isinstance(e2, np.ndarray):

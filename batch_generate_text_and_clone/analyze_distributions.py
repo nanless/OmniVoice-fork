@@ -32,6 +32,10 @@ EVAL_DIR = Path(__file__).resolve().parent
 PIPELINE_DIR = EVAL_DIR.parent
 sys.path.insert(0, str(PIPELINE_DIR))
 
+EVAL_SIM_DIR = EVAL_DIR / "eval_sim"
+sys.path.insert(0, str(EVAL_SIM_DIR))
+from metric_contract import SimilarityCollectionValidator, similarity_metadata  # noqa: E402
+
 DEFAULT_OUT_DIR = Path(
     os.environ.get(
         "CLONED_VOICES_ROOT",
@@ -122,8 +126,7 @@ def load_cer_data(out_dir: Path) -> List[dict]:
             records.append({
                 "wav": wav,
                 "dataset": extract_dataset(wav, str(out_dir)),
-                "manual_cer": r.get("manual_cer"),
-                "llm_cer": r.get("llm_cer"),
+                "cer": r.get("cer"),
             })
     print(f"[CER] Loaded {len(records)} records in {time.time() - t0:.1f}s", file=sys.stderr)
     return records
@@ -132,24 +135,23 @@ def load_cer_data(out_dir: Path) -> List[dict]:
 def load_sim_data(out_dir: Path) -> List[dict]:
     """Load SIM data from eval_sim_details.jsonl and worker part files, deduplicating by cloned_audio."""
     t0 = time.time()
-    seen = set()
+    validator = SimilarityCollectionValidator()
     records = []
 
     sim_files = sorted(out_dir.glob("eval_sim_details*.jsonl"))
     for sfp in sim_files:
         with open(sfp, encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     r = json.loads(line)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{sfp}:{line_no}: invalid JSON: {exc}") from exc
+                if not validator.add(r, f"{sfp}:{line_no}"):
                     continue
-                wav = r.get("cloned_audio", "")
-                if wav in seen:
-                    continue
-                seen.add(wav)
+                wav = r["cloned_audio"]
                 records.append({
                     "wav": wav,
                     "dataset": r.get("dataset", extract_dataset(wav, str(out_dir))),
@@ -233,8 +235,7 @@ def build_joined_table(cer_data: list, sim_data: list, mos_data: list) -> list:
 
         row["dataset"] = r_cer.get("dataset") or r_sim.get("dataset") or r_mos.get("dataset") or "unknown"
         row["language"] = r_sim.get("language") or r_mos.get("language") or "unknown"
-        row["manual_cer"] = r_cer.get("manual_cer")
-        row["llm_cer"] = r_cer.get("llm_cer")
+        row["cer"] = r_cer.get("cer")
         row["similarity"] = r_sim.get("similarity")
         row["utmos"] = r_mos.get("utmos")
         row["speed"] = r_mos.get("speed") or r_sim.get("speed")
@@ -312,40 +313,35 @@ def print_text_report(
     buf.write(" 1. Character Error Rate (CER)\n")
     buf.write("━" * 72 + "\n\n")
 
-    manual_vals = [r["manual_cer"] for r in cer_records if r["manual_cer"] is not None]
-    llm_vals = [r["llm_cer"] for r in cer_records if r["llm_cer"] is not None]
+    cer_vals = [r["cer"] for r in cer_records if r["cer"] is not None]
 
     buf.write(f"  Total CER records: {len(cer_records)}\n")
-    buf.write(f"  With manual CER:   {len(manual_vals)}\n")
-    buf.write(f"  With LLM CER:      {len(llm_vals)}\n\n")
+    buf.write(f"  With deterministic CER v4: {len(cer_vals)}\n\n")
 
-    buf.write("  ── Manual CER ──\n")
-    buf.write(format_stats_section("Overall", compute_stats(manual_vals)))
+    buf.write("  ── Deterministic safe-TN CER v4 ──\n")
+    buf.write(format_stats_section("Overall", compute_stats(cer_vals)))
 
     cer_by_ds = defaultdict(list)
     cer_by_lang = defaultdict(list)
     for r in cer_records:
         ds = r.get("dataset", "unknown")
         lang = r.get("language", "unknown")
-        if r["manual_cer"] is not None:
-            cer_by_ds[ds].append(r["manual_cer"])
-            cer_by_lang[lang].append(r["manual_cer"])
+        if r["cer"] is not None:
+            cer_by_ds[ds].append(r["cer"])
+            cer_by_lang[lang].append(r["cer"])
     if cer_by_ds:
-        buf.write("\n  ── Manual CER by Dataset ──\n")
+        buf.write("\n  ── CER by Dataset ──\n")
         for ds in sorted(cer_by_ds.keys()):
             buf.write(format_stats_section(ds, compute_stats(cer_by_ds[ds])))
-    if llm_vals:
-        buf.write("\n  ── LLM CER ──\n")
-        buf.write(format_stats_section("Overall", compute_stats(llm_vals)))
 
     # SIM
     buf.write("\n" + "━" * 72 + "\n")
-    buf.write(" 2. Speaker Similarity\n")
+    buf.write(" 2. Raw Cosine Speaker Similarity [-1, 1]\n")
     buf.write("━" * 72 + "\n\n")
 
     sim_vals = [r["similarity"] for r in sim_records if r["similarity"] is not None]
     buf.write(f"  Total SIM records: {len(sim_records)}\n")
-    buf.write(f"  With similarity:   {len(sim_vals)}\n\n")
+    buf.write(f"  With raw cosine:   {len(sim_vals)}\n\n")
     buf.write(format_stats_section("Overall", compute_stats(sim_vals)))
 
     sim_by_ds = defaultdict(list)
@@ -357,7 +353,7 @@ def print_text_report(
             sim_by_ds[ds].append(r["similarity"])
             sim_by_lang[lang].append(r["similarity"])
     if sim_by_ds:
-        buf.write("\n  ── Similarity by Dataset ──\n")
+        buf.write("\n  ── Raw Cosine Similarity by Dataset ──\n")
         for ds in sorted(sim_by_ds.keys()):
             buf.write(format_stats_section(ds, compute_stats(sim_by_ds[ds])))
 
@@ -391,12 +387,12 @@ def print_text_report(
 
     table_vals = [
         r for r in table
-        if r["manual_cer"] is not None and r["similarity"] is not None and r["utmos"] is not None
+        if r["cer"] is not None and r["similarity"] is not None and r["utmos"] is not None
     ]
     buf.write(f"  Paired records: {len(table_vals)}\n\n")
 
     if len(table_vals) >= 3:
-        cer_a = np.array([r["manual_cer"] for r in table_vals])
+        cer_a = np.array([r["cer"] for r in table_vals])
         sim_a = np.array([r["similarity"] for r in table_vals])
         mos_a = np.array([r["utmos"] for r in table_vals])
 
@@ -423,7 +419,7 @@ def print_text_report(
 
     # Build per-dataset summary
     def _ds_stats(ds):
-        c = compute_stats([r["manual_cer"] for r in cer_records if r.get("dataset") == ds and r["manual_cer"] is not None])
+        c = compute_stats([r["cer"] for r in cer_records if r.get("dataset") == ds and r["cer"] is not None])
         s = compute_stats([r["similarity"] for r in sim_records if r.get("dataset") == ds and r["similarity"] is not None])
         m = compute_stats([r["utmos"] for r in mos_records if r.get("dataset") == ds and r["utmos"] is not None])
         return c, s, m
@@ -444,7 +440,7 @@ def print_text_report(
         sn = _short_name(ds)
         rows.append((sn, c, s, m))
     max_name = max(len(r[0]) for r in rows) if rows else 10
-    header = f"  {'Dataset':<{max_name}s} {'CER_n':>7s} {'CER_mean':>9s} {'SIM_n':>7s} {'SIM_mean':>9s} {'MOS_n':>7s} {'MOS_mean':>9s}"
+    header = f"  {'Dataset':<{max_name}s} {'CER_n':>7s} {'CER_mean':>9s} {'SIM_n':>7s} {'RAW_SIM':>9s} {'MOS_n':>7s} {'MOS_mean':>9s}"
     buf.write(header + "\n")
     buf.write(f"  {'─'*max_name} {'─'*7} {'─'*9} {'─'*7} {'─'*9} {'─'*7} {'─'*9}\n")
     for sn, c, s, m in rows:
@@ -489,19 +485,18 @@ def build_json_report(cer_records, sim_records, mos_records, table) -> dict:
     report = {
         "out_dir": str(DEFAULT_OUT_DIR),
         "cer": _build_metric(
-            [r["manual_cer"] for r in cer_records if r["manual_cer"] is not None],
-            cer_records, "manual_cer",
+            [r["cer"] for r in cer_records if r["cer"] is not None],
+            cer_records, "cer",
         ),
     }
-    # LLM CER
-    llm_vals = [r["llm_cer"] for r in cer_records if r["llm_cer"] is not None]
-    if llm_vals:
-        report["cer_llm"] = _build_metric(llm_vals, cer_records, "llm_cer")
 
-    report["sim"] = _build_metric(
-        [r["similarity"] for r in sim_records if r["similarity"] is not None],
-        sim_records, "similarity",
-    )
+    report["sim"] = {
+        **similarity_metadata(),
+        **_build_metric(
+            [r["similarity"] for r in sim_records if r["similarity"] is not None],
+            sim_records, "similarity",
+        ),
+    }
     report["mos"] = _build_metric(
         [r["utmos"] for r in mos_records if r["utmos"] is not None],
         mos_records, "utmos",
@@ -510,10 +505,10 @@ def build_json_report(cer_records, sim_records, mos_records, table) -> dict:
     # Correlations
     table_vals = [
         r for r in table
-        if r["manual_cer"] is not None and r["similarity"] is not None and r["utmos"] is not None
+        if r["cer"] is not None and r["similarity"] is not None and r["utmos"] is not None
     ]
     if len(table_vals) >= 3:
-        cer_a = np.array([r["manual_cer"] for r in table_vals])
+        cer_a = np.array([r["cer"] for r in table_vals])
         sim_a = np.array([r["similarity"] for r in table_vals])
         mos_a = np.array([r["utmos"] for r in table_vals])
         report["correlations"] = {

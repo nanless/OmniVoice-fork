@@ -11,13 +11,19 @@
 #   tmux attach -t eval_all                                       # 查看进度
 #
 #   IN_TMUX=1 bash batch_generate_text_and_clone/run_eval_all.sh  # 前台/已在 tmux 内
-#   PARALLEL_SIM=1  CER 与 SIM 并行（默认 1）；MOS 仍等两者结束后跑
+#   PARALLEL_SIM=1  CER 与 SIM 并行（默认 0）；GPU 集合不得重叠
 #   SKIP_EXISTING=0  全量重算（默认 1 跳过已有 sidecar）
 
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 SESSION="${EVAL_TMUX_SESSION:-eval_all}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT_DIR="${CLONED_VOICES_ROOT:-/root/group-shared/voiceprint/data/speech/voice_activity_detection/batch_cloned_voices_ommivoice_kids_finetuned}"
+CER_GPU="${CER_GPU:-${GPU:-0}}"
+SIM_GPUS="${SIM_GPUS:-${GPUS:-1,2,3,4}}"
+MOS_GPUS="${MOS_GPUS:-$SIM_GPUS}"
+PARALLEL_SIM="${PARALLEL_SIM:-0}"
 
 if [[ "${IN_TMUX:-0}" != "1" ]]; then
   if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -25,16 +31,18 @@ if [[ "${IN_TMUX:-0}" != "1" ]]; then
     exit 1
   fi
   tmux new-session -d -s "$SESSION" \
-    "IN_TMUX=1 GPU='${GPU:-0}' GPUS='${GPUS:-${GPU:-0}}' SKIP_CER='${SKIP_CER:-0}' SKIP_SIM='${SKIP_SIM:-0}' SKIP_MOS='${SKIP_MOS:-0}' SKIP_EXISTING='${SKIP_EXISTING:-1}' EVAL_WORKERS='${EVAL_WORKERS:-4}' PARALLEL_SIM='${PARALLEL_SIM:-1}' exec bash '$SCRIPT'"
+    "IN_TMUX=1 CLONED_VOICES_ROOT='$OUT_DIR' CER_GPU='$CER_GPU' SIM_GPUS='$SIM_GPUS' MOS_GPUS='$MOS_GPUS' SKIP_CER='${SKIP_CER:-0}' SKIP_SIM='${SKIP_SIM:-0}' SKIP_MOS='${SKIP_MOS:-0}' SKIP_EXISTING='${SKIP_EXISTING:-1}' SKIP_ASR='${SKIP_ASR:-0}' REFRESH_CER='${REFRESH_CER:-0}' REFRESH_ASR='${REFRESH_ASR:-0}' ALLOW_PARTIAL='${ALLOW_PARTIAL:-0}' ASR_BATCH_SIZE='${ASR_BATCH_SIZE:-16}' EVAL_WORKERS='${EVAL_WORKERS:-}' PYTHON='${PYTHON:-}' PYTHON_CER='${PYTHON_CER:-}' TTS_EVAL_MODEL_DIR='${TTS_EVAL_MODEL_DIR:-}' PARALLEL_SIM='$PARALLEL_SIM' exec bash '$SCRIPT'"
   echo "Started tmux session: $SESSION"
   echo "  attach: tmux attach -t $SESSION"
-  echo "  logs:   tail -f ${CLONED_VOICES_ROOT:-$(cd "$(dirname "$0")/.." && pwd)/batch_cloned_voices}/logs/eval_all/main.log"
+  echo "  logs:   tail -f $OUT_DIR/logs/eval_all/main.log"
   exit 0
 fi
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT_DIR="${CLONED_VOICES_ROOT:-$ROOT/batch_cloned_voices}"
-GPU="${GPU:-0}"
+if [[ ! -d "$OUT_DIR" ]]; then
+  echo "ERROR: clone output directory does not exist: $OUT_DIR" >&2
+  exit 1
+fi
+
 LOG_DIR="$OUT_DIR/logs/eval_all"
 mkdir -p "$LOG_DIR"
 
@@ -43,8 +51,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-1}"
-# CER uses GPU from env; SIM/MOS spawn workers with --gpus
-export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+# CER receives one isolated GPU; SIM/MOS spawn workers from explicit GPU lists.
 
 PYTHON="${PYTHON:-/root/miniforge3/envs/omnivoice/bin/python}"
 PYTHON_CER="${PYTHON_CER:-/root/miniforge3/envs/qwen3-asr/bin/python}"
@@ -76,28 +83,58 @@ run_py_cer() {
 
 COMMON=(--out-dir "$OUT_DIR")
 [[ "${SKIP_EXISTING:-1}" == "1" ]] && COMMON+=(--skip-existing)
+SIM_COMMON=("${COMMON[@]}")
+[[ "${ALLOW_PARTIAL:-0}" == "1" ]] && SIM_COMMON+=(--allow-partial)
+MOS_COMMON=("${COMMON[@]}")
+[[ "${ALLOW_PARTIAL:-0}" == "1" ]] && MOS_COMMON+=(--allow-partial)
 
 ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-16}"
-LLM_CONCURRENCY="${LLM_CONCURRENCY:-5}"
-GPUS="${GPUS:-${GPU:-0}}"
-EVAL_WORKERS="${EVAL_WORKERS:-4}"
-PARALLEL_SIM="${PARALLEL_SIM:-1}"
+IFS=',' read -r -a SIM_GPU_ARRAY <<< "$SIM_GPUS"
+EVAL_WORKERS="${EVAL_WORKERS:-${#SIM_GPU_ARRAY[@]}}"
 
-log "======== Full eval: CER ${PARALLEL_SIM:+(+ SIM parallel) }→ MOS ========"
-log "OUT=$OUT_DIR GPUS=$GPUS ASR_BATCH=$ASR_BATCH_SIZE ITN_WORKERS=$LLM_CONCURRENCY WORKERS=$EVAL_WORKERS PARALLEL_SIM=$PARALLEL_SIM SKIP_EXISTING=${SKIP_EXISTING:-1}"
+gpu_lists_overlap() {
+  local left="$1"
+  local right=",${2// /},"
+  local gpu_id
+  IFS=',' read -r -a left_ids <<< "$left"
+  for gpu_id in "${left_ids[@]}"; do
+    gpu_id="${gpu_id// /}"
+    if [[ -n "$gpu_id" && "$right" == *",$gpu_id,"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ "$PARALLEL_SIM" == "1" ]] \
+  && [[ "${SKIP_CER:-0}" != "1" ]] \
+  && [[ "${SKIP_SIM:-0}" != "1" ]] \
+  && gpu_lists_overlap "$CER_GPU" "$SIM_GPUS"; then
+  echo "ERROR: parallel CER/SIM GPU sets overlap: CER_GPU=$CER_GPU SIM_GPUS=$SIM_GPUS" >&2
+  exit 1
+fi
+
+log "======== Full eval: CER → SIM → MOS ========"
+log "OUT=$OUT_DIR CER_GPU=$CER_GPU SIM_GPUS=$SIM_GPUS MOS_GPUS=$MOS_GPUS ASR_BATCH=$ASR_BATCH_SIZE WORKERS=$EVAL_WORKERS PARALLEL_SIM=$PARALLEL_SIM SKIP_EXISTING=${SKIP_EXISTING:-1}"
 log "PYTHON=$PYTHON PYTHON_CER=$PYTHON_CER"
 log "Logs: $LOG_DIR"
 
-CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE" --llm-concurrency "$LLM_CONCURRENCY")
-[[ "${SKIP_EXISTING:-1}" == "1" ]] && CER_ARGS+=(--skip-existing)
-[[ "${SKIP_LLM:-0}" == "1" ]] && CER_ARGS+=(--skip-llm)
+CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE")
+if [[ "${SKIP_EXISTING:-1}" == "1" ]] \
+  && [[ "${REFRESH_CER:-0}" != "1" ]] \
+  && [[ "${REFRESH_ASR:-0}" != "1" ]]; then
+  CER_ARGS+=(--skip-existing)
+fi
 [[ "${SKIP_ASR:-0}" == "1" ]] && CER_ARGS+=(--skip-asr)
-[[ "${REFRESH_LLM:-0}" == "1" ]] && CER_ARGS+=(--refresh-llm-cache)
+[[ "${REFRESH_CER:-0}" == "1" ]] && CER_ARGS+=(--refresh-cer)
+[[ "${REFRESH_ASR:-0}" == "1" ]] && CER_ARGS+=(--refresh-asr-cache)
+[[ "${ALLOW_PARTIAL:-0}" == "1" ]] && CER_ARGS+=(--allow-partial)
 
 run_cer() {
   log "[CER] START eval_cloned.py ($PYTHON_CER)"
   : > "$CER_LOG"
-  (cd "$ROOT/batch_generate_text_and_clone/eval_cer" && \
+  (export CUDA_VISIBLE_DEVICES="$CER_GPU"
+    cd "$ROOT/batch_generate_text_and_clone/eval_cer" && \
     run_py_cer "$CER_LOG" eval_cloned.py "${CER_ARGS[@]}")
   log "[CER] END"
 }
@@ -106,12 +143,12 @@ run_sim() {
   log "[SIM] START eval_clone_similarity.py"
   : > "$SIM_LOG"
   run_py "$SIM_LOG" "$ROOT/batch_generate_text_and_clone/eval_sim/eval_clone_similarity.py" \
-    "${COMMON[@]}" --model-dir "$MODEL_SIM" --gpus "$GPUS" --workers "$EVAL_WORKERS"
+    "${SIM_COMMON[@]}" --model-dir "$MODEL_SIM" --gpus "$SIM_GPUS" --workers "$EVAL_WORKERS"
   log "[SIM] END"
 }
 
 if [[ "${SKIP_CER:-0}" != "1" ]] && [[ "${SKIP_SIM:-0}" != "1" ]] && [[ "$PARALLEL_SIM" == "1" ]]; then
-  log "[1/3] START CER + SIM (parallel, shared GPU $GPUS)"
+  log "[1/3] START CER + SIM (parallel, disjoint GPUs)"
   run_cer &
   CER_PID=$!
   run_sim &
@@ -145,7 +182,7 @@ if [[ "${SKIP_MOS:-0}" != "1" ]]; then
   log "[3/3] START MOS (eval_mos)"
   : > "$MOS_LOG"
   run_py "$MOS_LOG" "$ROOT/batch_generate_text_and_clone/eval_mos/eval_clone_mos.py" \
-    "${COMMON[@]}" --model-dir "$MODEL_MOS" --gpus "$GPUS" --workers "$EVAL_WORKERS"
+    "${MOS_COMMON[@]}" --model-dir "$MODEL_MOS" --gpus "$MOS_GPUS" --workers "$EVAL_WORKERS"
   log "[3/3] END MOS"
 fi
 

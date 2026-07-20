@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Delete bad cloned audios and copy good ones to target speaker directories.
 
-Rules:
-  DELETE: CER >= 0.05  AND NOT (CER <= 0.1 AND SIM > 0.85)
-  COPY:   CER < 0.05  AND SIM > 0.8
-  COPY:   CER <= 0.1   AND SIM > 0.85
+Rules (default raw cosine threshold: 0.80):
+  DELETE: CER >= 0.05  AND NOT (CER <= 0.1 AND raw cosine SIM > threshold)
+  COPY:   CER <= 0.1   AND raw cosine SIM > threshold
   KEEP:   everything else (stay in source, no action)
 
 Naming:
@@ -15,15 +14,16 @@ Naming:
   {ref_audio_stem}_clone_text_NNN.mos.json
 
 Usage:
-    python prune_and_copy.py                     # execute
-    python prune_and_copy.py --dry-run           # preview only
-    python prune_and_copy.py --workers 8         # parallel copy
+    python prune_and_copy.py                     # preview only
+    python prune_and_copy.py --execute           # delete/copy after review
+    python prune_and_copy.py --execute --workers 8
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -41,34 +41,118 @@ DEFAULT_OUT_DIR = Path(
 
 DEFAULT_TARGET_ROOT = Path(
     "/root/group-shared/voiceprint/data/speech/speaker_diarization"
-    "/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130/audio"
+    "/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130"
+    "/audio_omnivoice_clone_sim0.8_filtered"
 )
+
+DEFAULT_SIM_THRESHOLD = 0.80
 
 SIDECAR_SUFFIXES = [".json", ".eval.json", ".sim.json", ".mos.json"]
 SIDECAR_RENAME = {".eval.json": ".cer.json"}
+
+EVAL_SIM_DIR = Path(__file__).resolve().parent / "eval_sim"
+sys.path.insert(0, str(EVAL_SIM_DIR))
+from metric_contract import (  # noqa: E402
+    SimilarityCollectionValidator,
+    validate_current_audio_files,
+    validate_current_model_files,
+)
+EVAL_CER_DIR = Path(__file__).resolve().parent / "eval_cer"
+sys.path.insert(0, str(EVAL_CER_DIR))
+from cer_normalization import (  # noqa: E402
+    CER_SCORE_VERSION,
+    EVAL_SCHEMA_VERSION,
+    NORMALIZATION_VERSION,
+    SAFE_PROFILE,
+    normalization_fingerprint,
+    reference_normalization_input_fingerprint,
+)
+from eval_contract import (  # noqa: E402
+    asr_decode_fingerprint,
+    asr_model_fingerprint,
+)
+from eval_common import iter_clone_records  # noqa: E402
 
 
 # ────────────────────────────────────────────────────────────────────
 # Data loading
 # ────────────────────────────────────────────────────────────────────
 
-def load_cer_data(cer_path: Path) -> Dict[str, float]:
-    """Load {wav_path: manual_cer} from eval_cer_details.jsonl."""
+def load_cer_data(
+    cer_path: Path, inventory_records: Dict[str, dict]
+) -> Dict[str, float]:
+    """Load {wav_path: deterministic CER v4} from eval_cer_details.jsonl."""
     print("[load] CER data…", file=sys.stderr, flush=True)
     data = {}
     with open(cer_path, encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 r = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{cer_path}:{line_no}: invalid JSON: {exc}") from exc
             wav = r.get("wav", "")
-            cer = r.get("manual_cer")
-            if wav and cer is not None:
-                data[wav] = cer
+            if (
+                r.get("eval_schema_version") != EVAL_SCHEMA_VERSION
+                or r.get("cer_metric") != "deterministic_char_cer"
+                or r.get("cer_score_version") != CER_SCORE_VERSION
+                or r.get("normalization_profile") != SAFE_PROFILE
+                or r.get("normalization_version") != NORMALIZATION_VERSION
+                or r.get("normalization_fingerprint")
+                != normalization_fingerprint(SAFE_PROFILE)
+                or r.get("asr_model_fingerprint") != asr_model_fingerprint()
+                or r.get("asr_decode_fingerprint") != asr_decode_fingerprint()
+                or r.get("stage") != "complete"
+            ):
+                raise ValueError(f"{cer_path}:{line_no}: non-v4 CER row for {wav!r}")
+            cer = r.get("cer")
+            if not isinstance(wav, str) or not wav:
+                raise ValueError(f"{cer_path}:{line_no}: missing wav path")
+            if (
+                isinstance(cer, bool)
+                or not isinstance(cer, (int, float))
+                or not math.isfinite(float(cer))
+                or cer < 0
+            ):
+                raise ValueError(f"{cer_path}:{line_no}: invalid cer for {wav!r}: {cer!r}")
+            try:
+                stat = Path(wav).stat()
+            except OSError as exc:
+                raise ValueError(
+                    f"{cer_path}:{line_no}: cannot stat current WAV {wav!r}: {exc}"
+                ) from exc
+            if r.get("cloned_audio_signature") != {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }:
+                raise ValueError(
+                    f"{cer_path}:{line_no}: stale CER signature for {wav!r}"
+                )
+            clone = inventory_records.get(wav)
+            if clone is not None:
+                text = clone.get("gen_text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError(
+                        f"{cer_path}:{line_no}: current clone metadata has no gen_text"
+                    )
+                expected_input = reference_normalization_input_fingerprint(
+                    text,
+                    language=clone.get("language"),
+                    lang_type=clone.get("lang_type") or clone.get("lang_key"),
+                )
+                if r.get("reference_normalization_input_fingerprint") != expected_input:
+                    raise ValueError(
+                        f"{cer_path}:{line_no}: stale reference normalization input for {wav!r}"
+                    )
+            value = float(cer)
+            if wav in data and not math.isclose(data[wav], value, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    f"{cer_path}:{line_no}: conflicting duplicate CER for {wav!r}: "
+                    f"{value!r} vs {data[wav]!r}"
+                )
+            data[wav] = value
     print(f"[load] CER: {len(data):,} records", file=sys.stderr)
     return data
 
@@ -76,23 +160,33 @@ def load_cer_data(cer_path: Path) -> Dict[str, float]:
 def load_sim_data(sim_dir: Path) -> Dict[str, dict]:
     """Load {cloned_audio: {similarity, ref_audio, dataset, ...}} from all sim jsonl files."""
     print("[load] SIM data…", file=sys.stderr, flush=True)
-    seen = set()
-    data = {}
+    validator = SimilarityCollectionValidator()
     files = sorted(sim_dir.glob("eval_sim_details*.jsonl"))
+    if not files:
+        raise FileNotFoundError(f"No eval_sim_details*.jsonl found in {sim_dir}")
     for fp in files:
         with open(fp, encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                wav = r.get("cloned_audio", "")
-                if wav and wav not in seen:
-                    seen.add(wav)
-                    data[wav] = r
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{fp}:{line_no}: invalid JSON: {exc}") from exc
+                source = f"{fp}:{line_no}"
+                validator.add(r, source)
+                validate_current_audio_files(r, source)
+    data = dict(validator.records)
+    if not data:
+        raise ValueError(f"No valid raw-cosine v2 records found in {sim_dir}")
+    failed = [wav for wav, record in data.items() if record.get("similarity") is None]
+    if failed:
+        preview = "\n  ".join(failed[:5])
+        raise ValueError(
+            f"Refusing destructive classification: {len(failed)} similarity records "
+            f"have null scores. Re-run eval_sim successfully.\n  {preview}"
+        )
     print(f"[load] SIM: {len(data):,} records from {len(files)} files", file=sys.stderr)
     return data
 
@@ -110,6 +204,16 @@ def parse_ref_audio(ref_path: str, cloned_path: str = "") -> Optional[Tuple[str,
         return None
     parts = ref_path.split("/")
     norm = ref_path.lower()
+
+    # Canonical merged-dataset reference layout:
+    #   .../audio/<dataset>/<speaker>/<wav>
+    canonical_datasets = {
+        "childmandarin", "chineseenglishchildren", "king-asr-725",
+        "kingasr612", "speechocean762",
+    }
+    for index, part in enumerate(parts[:-2]):
+        if part == "audio" and parts[index + 1] in canonical_datasets:
+            return (parts[index + 1], parts[index + 2], Path(ref_path).stem)
 
     # Chinese_English_Children: .../WAV/G0001/G0001_X_SXXXX.wav
     if "chinese_english" in norm or "children_integrated" in norm:
@@ -158,24 +262,25 @@ def parse_ref_audio(ref_path: str, cloned_path: str = "") -> Optional[Tuple[str,
 # Classification
 # ────────────────────────────────────────────────────────────────────
 
-def classify(cer: Optional[float], sim: Optional[float]) -> str:
+def classify(
+    cer: Optional[float],
+    sim: Optional[float],
+    sim_threshold: float = DEFAULT_SIM_THRESHOLD,
+) -> str:
     """Return: 'COPY' | 'DELETE' | 'KEEP'."""
-    if cer is None:
+    if cer is None or sim is None:
         return "KEEP"
 
-    sim_gt_085 = sim is not None and sim > 0.85
-    sim_gt_08 = sim is not None and sim > 0.8
+    sim_pass = sim > sim_threshold
     cer_lt_005 = cer < 0.05
     cer_le_01 = cer <= 0.1
 
-    # COPY rules
-    if cer_lt_005 and sim_gt_08:
-        return "COPY"
-    if cer_le_01 and sim_gt_085:
+    # COPY: acceptable content and voice similarity above the configured threshold.
+    if cer_le_01 and sim_pass:
         return "COPY"
 
-    # DELETE: CER >= 0.05, not exempted by SIM>0.85 AND CER<=0.1
-    if not cer_lt_005 and not (cer_le_01 and sim_gt_085):
+    # DELETE: CER >= 0.05 unless already accepted by the COPY rule above.
+    if not cer_lt_005:
         return "DELETE"
 
     return "KEEP"
@@ -225,21 +330,30 @@ def _copy_one(args: Tuple[str, dict]) -> Tuple[int, int, Optional[str]]:
     target_spk = ref_info["target_spk"]
     ref_stem = ref_info["ref_stem"]
 
-    # Check target speaker dir exists
+    # A top-up round may restore a speaker that had no previously accepted clone.
     spk_dir = Path(target_root) / target_ds / target_spk
-    if not spk_dir.is_dir():
-        return 0, 0, f"target dir missing: {spk_dir}"
+    if not dry:
+        spk_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine cloned filename parts
-    cloned_name = wav.name  # e.g., text_003.wav
     cloned_stem = wav.stem  # e.g., text_003
-    new_prefix = f"{ref_stem}_clone_{cloned_stem}"
+    task_id = None
+    clone_meta_path = wav.with_suffix(".json")
+    if clone_meta_path.is_file():
+        try:
+            task_id = json.loads(clone_meta_path.read_text(encoding="utf-8")).get("task_id")
+        except (json.JSONDecodeError, OSError):
+            task_id = None
+    unique_suffix = str(task_id)[:16] if task_id else cloned_stem
+    new_prefix = f"{ref_stem}_clone_{unique_suffix}"
 
     ok, fail = 0, 0
     # Copy wav
     dst_wav = spk_dir / f"{new_prefix}.wav"
     try:
         if not dry:
+            if dst_wav.exists() and dst_wav.read_bytes() != wav.read_bytes():
+                return 0, 1, f"refusing to overwrite different audio: {dst_wav}"
             shutil.copy2(str(wav), str(dst_wav))
         ok += 1
     except OSError as e:
@@ -272,12 +386,34 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--target-root", type=Path, default=DEFAULT_TARGET_ROOT)
-    parser.add_argument("--dry-run", action="store_true", help="Preview only, no changes")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually delete/copy files; default is a read-only preview",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Deprecated explicit preview flag; preview is already the default",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Parallel copy workers")
     parser.add_argument("--skip-delete", action="store_true", help="Skip deletion, only copy")
     parser.add_argument("--skip-copy", action="store_true", help="Skip copy, only delete")
+    parser.add_argument(
+        "--min-sim",
+        type=float,
+        default=DEFAULT_SIM_THRESHOLD,
+        help=f"Raw cosine similarity threshold (exclusive; default: {DEFAULT_SIM_THRESHOLD})",
+    )
     parser.add_argument("--log", type=Path, default=None, help="Write operation log")
     args = parser.parse_args()
+
+    if args.execute and args.dry_run:
+        parser.error("--execute and --dry-run are mutually exclusive")
+    args.dry_run = not args.execute
+
+    if not math.isfinite(args.min_sim) or not -1.0 <= args.min_sim <= 1.0:
+        parser.error("--min-sim must be finite and in [-1, 1]")
 
     t0 = time.time()
 
@@ -287,8 +423,55 @@ def main():
         print(f"ERROR: {cer_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    cer_data = load_cer_data(cer_path)
+    inventory_records = {
+        str(wav): record
+        for wav, _, record in iter_clone_records(
+            args.out_dir.resolve(), allow_partial=False
+        )
+    }
+    inventory = set(inventory_records)
+    cer_data = load_cer_data(cer_path, inventory_records)
+    extra_cer = set(cer_data) - inventory
+    missing_cer = inventory - set(cer_data)
+    if extra_cer or missing_cer:
+        raise RuntimeError(
+            "Refusing destructive classification: canonical CER coverage does not "
+            f"match clone inventory (missing={len(missing_cer)}, extra={len(extra_cer)})"
+        )
     sim_data = load_sim_data(args.out_dir)
+    first_sim = next(iter(sim_data.values()))
+    validate_current_model_files(first_sim, "similarity collection")
+
+    resolved_root = args.out_dir.resolve()
+    outside = []
+    missing_audio = []
+    for wav in cer_data:
+        resolved_wav = Path(wav).resolve()
+        try:
+            resolved_wav.relative_to(resolved_root)
+        except ValueError:
+            outside.append(wav)
+        if not resolved_wav.is_file():
+            missing_audio.append(wav)
+    if outside:
+        preview = "\n  ".join(outside[:5])
+        raise RuntimeError(
+            f"Refusing destructive classification: {len(outside)} CER paths are outside "
+            f"--out-dir {resolved_root}.\n  {preview}"
+        )
+    if missing_audio:
+        preview = "\n  ".join(missing_audio[:5])
+        raise RuntimeError(
+            f"Refusing destructive classification: {len(missing_audio)} CER audio files "
+            f"are missing.\n  {preview}"
+        )
+    missing_sim = sorted(set(cer_data) - set(sim_data))
+    if missing_sim:
+        preview = "\n  ".join(missing_sim[:5])
+        raise RuntimeError(
+            f"Refusing destructive classification: {len(missing_sim)} CER records "
+            f"have no raw-cosine v2 similarity record.\n  {preview}"
+        )
 
     # Classify
     print("\n[classify] Applying rules…", file=sys.stderr, flush=True)
@@ -301,7 +484,7 @@ def main():
     for wav, cer in cer_data.items():
         sim_rec = sim_data.get(wav, {})
         sim = sim_rec.get("similarity") if sim_rec else None
-        action = classify(cer, sim)
+        action = classify(cer, sim, sim_threshold=args.min_sim)
         stats[action] += 1
 
         if action == "COPY":
@@ -407,6 +590,7 @@ def main():
     if no_ref_count:
         print(f"  Skipped:  {no_ref_count} COPY candidates (no ref_audio)", file=sys.stderr)
     print(f"  Dry run:  {args.dry_run}", file=sys.stderr)
+    print(f"  Raw SIM:  > {args.min_sim}", file=sys.stderr)
 
     if args.log:
         log_entry = {
@@ -418,7 +602,11 @@ def main():
             "copied_fail": copy_fail,
             "kept": keep_count,
             "copy_skipped_no_ref": no_ref_count,
-            "rules": "DELETE: CER>=0.05 NOT (CER<=0.1 AND SIM>0.85); COPY: CER<0.05 SIM>0.8 OR CER<=0.1 SIM>0.85",
+            "min_raw_cosine_similarity": args.min_sim,
+            "rules": (
+                f"DELETE: CER>=0.05 unless CER<=0.1 AND raw_SIM>{args.min_sim}; "
+                f"COPY: CER<=0.1 AND raw_SIM>{args.min_sim}"
+            ),
         }
         args.log.write_text(json.dumps(log_entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

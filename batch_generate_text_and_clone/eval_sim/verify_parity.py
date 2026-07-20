@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL_DIR))
@@ -54,7 +55,9 @@ def main():
         emb_cl_diff = torch.max(torch.abs(e_cl_ws - e_cl_es)).item()
         max_emb_diff = max(max_emb_diff, emb_ref_diff, emb_cl_diff)
 
-        sim_ws = ws.cosine_similarity(e_ref_ws, e_cl_ws)
+        # Compare raw cosine directly. wespeaker's convenience method may apply
+        # a legacy (cosine + 1) / 2 score transform.
+        sim_ws = F.cosine_similarity(e_ref_ws.flatten(), e_cl_ws.flatten(), dim=0).item()
         sim_es = es.cosine_similarity(e_ref_es, e_cl_es)
         sim_diff = abs(sim_ws - sim_es)
         max_sim_diff = max(max_sim_diff, sim_diff)

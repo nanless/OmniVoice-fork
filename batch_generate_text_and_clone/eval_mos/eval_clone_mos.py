@@ -66,14 +66,19 @@ DEFAULT_OUT_DIR = Path(
 ALL_METRICS = AVAILABLE_METRICS
 
 
-def find_cloned_wavs(out_dir: Path, scan_workers: int = 8) -> List[Tuple[Path, Path]]:
-    return list_clone_items(out_dir, label="eval-scan", scan_workers=scan_workers)
+def find_cloned_wavs(
+    out_dir: Path,
+    scan_workers: int = 8,
+    allow_partial: bool = False,
+) -> List[Tuple[Path, Path]]:
+    return list_clone_items(
+        out_dir, label="eval-scan", scan_workers=scan_workers,
+        allow_partial=allow_partial,
+    )
 
 
 def write_eval_json(json_path: Path, record: dict):
-    json_path.with_suffix(".mos.json").write_text(
-        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(json_path.with_suffix(".mos.json"), record)
 
 
 def summarize(results: list, metrics: List[str]) -> dict:
@@ -256,6 +261,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-sidecar", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--allow-partial", action="store_true")
     args = parser.parse_args()
 
     # Parse metrics
@@ -270,7 +276,11 @@ def main():
     gpu_list = parse_gpu_list(args.gpus, args.gpu if args.gpu is not None else 0)
     workers = max(1, args.workers)
 
-    items = find_cloned_wavs(args.out_dir, scan_workers=max(8, args.workers * 2))
+    items = find_cloned_wavs(
+        args.out_dir,
+        scan_workers=max(8, args.workers * 2),
+        allow_partial=args.allow_partial,
+    )
     if not items:
         print("No cloned audio found.", flush=True)
         return

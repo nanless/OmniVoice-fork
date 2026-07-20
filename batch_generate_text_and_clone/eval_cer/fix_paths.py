@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fix paths in eval.json, ASR cache, and LLM cache after moving files."""
+"""Fix paths in deterministic CER sidecars and ASR cache after moving files."""
 
 import json
 import os
@@ -77,7 +77,7 @@ def fix_sidecar_json_files():
 
 
 def fix_cache_keys(cache_path: Path):
-    """Fix keys in ASR or LLM cache JSON file."""
+    """Fix keys in an ASR cache JSON file."""
     if not cache_path.exists():
         print(f"[cache] {cache_path} not found, skipping")
         return
@@ -112,8 +112,6 @@ def main():
     print("\n=== Fixing ASR cache keys ===")
     fix_cache_keys(TARGET_DIR / "eval_asr_cache.json")
 
-    print("\n=== Fixing LLM cache keys ===")
-    fix_cache_keys(TARGET_DIR / "eval_llm_itn_cache.json")
 
     print("\nDone!")
 

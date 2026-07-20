@@ -1,14 +1,17 @@
 # 儿童语音批量克隆（voice_clone）
 
-用 OmniVoice 对儿童说话人验证（SV）数据集的参考音进行批量 voice cloning：每条参考 wav 随机抽 **10 句** LLM 生成文本，以随机语速合成克隆音，输出 16 kHz wav 及 sidecar JSON。
+用 OmniVoice 对儿童参考音进行批量 voice cloning。推荐的 plan 模式按 speaker 的已接受总时长补齐到目标值，并输出可恢复、可审计的 16 kHz WAV 和 schema v3 sidecar；旧 dataset-scan 模式仍可用于小规模调试。
 
 ## 目录
 
 ```
 voice_clone/
 ├── README.md              # 本文档
-├── clone_dataset.py       # 主脚本：加载模型、分 worker、逐条克隆
-└── run_clone_8workers.sh  # 双 GPU × 4 worker 生产启动脚本
+├── speaker_topup_common.py # 精确 WAV 时长、speaker/数据集公共契约
+├── plan_speaker_topup.py   # 生成不可变的 speaker 补量计划
+├── check_speaker_target.py # 检查 accepted 总时长是否全部达标
+├── clone_dataset.py        # 加载模型、按 speaker 分 worker、断点续跑
+└── run_clone_8workers.sh   # 默认 8 GPU × 2 worker 生产启动脚本
 ```
 
 ## 环境
@@ -122,15 +125,14 @@ python batch_generate_text_and_clone/voice_clone/clone_dataset.py \
   --gpu 0 --worker-id 0 --num-workers 1 --limit 2
 ```
 
-### 生产：8 worker（双卡）
+### 生产：16 worker（默认 8 卡 × 每卡 2 worker）
 
 ```bash
 bash batch_generate_text_and_clone/voice_clone/run_clone_8workers.sh
 ```
 
-- GPU 0：worker 0–3  
-- GPU 1：worker 4–7  
-- 日志：`batch_cloned_voices/logs/gpu{0,1}_worker{N}.log`
+- GPU 0–7：默认每卡两个 worker，以提高 A800 利用率；可用 `GPUS`、`WORKERS_PER_GPU` 调整。
+- 日志：`$CLONED_VOICES_ROOT/logs/clone_$RUN_ID/gpu{GPU}_worker{N}.log`
 
 监控：
 
@@ -148,12 +150,15 @@ nvidia-smi -l 1
 | `--num-workers` | 1 | 总 worker 数；参考音按 `i % num_workers` 分配 |
 | `--limit` | 无 | 每个数据集最多处理 N 条（调试） |
 | `--dry-run` | off | 只打印分配样本，不加载模型 |
+| `--plan-jsonl` | 无 | 不可变补量计划；启用按 speaker 分片和 schema v3 |
+| `--out-dir` | 环境变量或内置路径 | 本轮 raw clone 根目录 |
+| `--max-attempts` | 3 | 同一任务允许的最大生成尝试次数 |
 
 ## Worker 分配逻辑
 
-1. 每个数据集内所有参考音 shuffle（seed=`{SEED}:shuffle:{ds_name}`）  
-2. 按索引 `% num_workers` 分给各 worker，保证负载大致均衡  
-3. 已存在 `text_*.wav` 的条目 **skip**（断点续跑）
+plan 模式对 `speaker_key` 做稳定 SHA-256 分片，同一个 speaker 只会归一个 worker；每个 worker 会流式校验整份计划，但仅在内存中保留自己的任务。完整且 plan/model/reference/output 签名都匹配的结果才会 skip。
+
+旧 dataset-scan 模式继续按数据集 shuffle 后的索引 `% num_workers` 分片。
 
 ## 生成配置修改
 
@@ -194,3 +199,33 @@ eval_mos         →  UTMOS（自然度）
 
 **10 句不够 / 太多？**  
 改 `TEXTS_PER_AUDIO`；注意已有输出不会自动重生成，需删目录或换 `OUT_ROOT`。
+
+## 每个 speaker 补齐到 30 分钟
+
+30 分钟按“合并数据集 `audio/<dataset>/<speaker>` 中的原音频 + 一个或多个已经通过质量筛选的 clone root”计算。未筛选的 raw clone 不计入达标时长。
+
+```bash
+BASE=/root/group-shared/voiceprint/data/speech/speaker_diarization/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130
+
+python batch_generate_text_and_clone/voice_clone/plan_speaker_topup.py \
+  --original-root "$BASE/audio" \
+  --accepted-root "$BASE/audio_omnivoice_clone_sim0.8_filtered" \
+  --target-seconds 1800 \
+  --round-id 20260720_r01 \
+  --plan-jsonl "$BASE/omnivoice_topup/round_001.plan.jsonl"
+
+CLONE_PLAN_JSONL="$BASE/omnivoice_topup/round_001.plan.jsonl" \
+CLONED_VOICES_ROOT="$BASE/omnivoice_topup/round_001_raw" \
+bash batch_generate_text_and_clone/voice_clone/run_clone_8workers.sh
+```
+
+随后对 `round_001_raw` 跑 CER/SIM/MOS，按 raw cosine `> 0.8` 和所需 CER/MOS 门槛复制到 accepted root，再检查：
+
+```bash
+python batch_generate_text_and_clone/voice_clone/check_speaker_target.py \
+  --original-root "$BASE/audio" \
+  --accepted-root "$BASE/audio_omnivoice_clone_sim0.8_filtered" \
+  --target-seconds 1800
+```
+
+checker 全部达标返回 0；仍有 speaker 缺口返回 1。此时用更新后的 accepted root 生成下一轮 plan。plan/task ID、speaker 分片、文件锁和 schema v3 sidecar 保证断点续跑及多 worker 幂等。
