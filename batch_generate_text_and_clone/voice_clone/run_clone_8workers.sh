@@ -121,6 +121,7 @@ if ! flock -n 9; then
   exit 1
 fi
 
+mkdir -p "$OUT_DIR/logs"
 LOG_DIR="$OUT_DIR/logs/clone_$RUN_ID"
 if ! mkdir "$LOG_DIR"; then
   echo "Log directory already exists; choose a unique RUN_ID: $LOG_DIR" >&2
