@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,6 +52,56 @@ def update_state(path: Path, state: dict, **updates) -> dict:
     state = {**state, **updates, "updated_at": datetime.now(timezone.utc).isoformat()}
     write_json_atomic(path, state)
     return state
+
+
+def wait_for_gpus(args) -> None:
+    if not args.wait_for_gpus:
+        return
+    requested = {int(value.strip()) for value in args.gpus.split(",") if value.strip()}
+    consecutive = 0
+    while consecutive < args.gpu_ready_consecutive:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"nvidia-smi failed: {result.stderr.strip()}")
+        readings = {}
+        for line in result.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 3:
+                raise ValueError(f"Unexpected nvidia-smi row: {line!r}")
+            index, utilization, memory = map(int, parts)
+            readings[index] = (utilization, memory)
+        if not requested <= readings.keys():
+            raise ValueError(f"Requested GPUs are unavailable: {sorted(requested)}")
+        busy = {
+            index: readings[index]
+            for index in sorted(requested)
+            if (
+                readings[index][0] > args.gpu_ready_max_util
+                or readings[index][1] > args.gpu_ready_max_memory_mib
+            )
+        }
+        if busy:
+            consecutive = 0
+            print(f"[gpu-wait] busy={busy}", flush=True)
+        else:
+            consecutive += 1
+            print(
+                f"[gpu-wait] ready sample "
+                f"{consecutive}/{args.gpu_ready_consecutive}",
+                flush=True,
+            )
+        if consecutive < args.gpu_ready_consecutive:
+            time.sleep(args.gpu_poll_seconds)
 
 
 def target_check(args, output: Path, log: Path) -> tuple[bool, dict]:
@@ -270,6 +321,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cer-threshold", type=float, default=0.1)
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--workers-per-gpu", type=int, default=2)
+    parser.add_argument("--wait-for-gpus", action="store_true")
+    parser.add_argument("--gpu-ready-max-util", type=int, default=10)
+    parser.add_argument("--gpu-ready-max-memory-mib", type=int, default=1024)
+    parser.add_argument("--gpu-ready-consecutive", type=int, default=3)
+    parser.add_argument("--gpu-poll-seconds", type=int, default=30)
     parser.add_argument("--asr-batch-size", type=int, default=16)
     parser.add_argument("--scan-workers", type=int, default=16)
     parser.add_argument("--python", default="/root/miniforge3/envs/omnivoice/bin/python")
@@ -281,8 +337,12 @@ def parse_args() -> argparse.Namespace:
         args.target_seconds <= 0
         or args.workers_per_gpu <= 0
         or args.history_reference_limit <= 0
+        or args.gpu_ready_max_util < 0
+        or args.gpu_ready_max_memory_mib < 0
+        or args.gpu_ready_consecutive <= 0
+        or args.gpu_poll_seconds <= 0
     ):
-        parser.error("target/workers must be positive")
+        parser.error("target/workers/GPU wait settings are invalid")
     return args
 
 
@@ -371,6 +431,9 @@ def main() -> int:
                     continue
             state = update_state(state_path, state, stage="PLANNING", round=number)
             plan_round(args, number, paths)
+            if not (paths["raw"] / ".clone_loop_finished.json").is_file():
+                state = update_state(state_path, state, stage="WAITING_FOR_GPUS")
+                wait_for_gpus(args)
             state = update_state(state_path, state, stage="CLONING")
             clone_code = clone_round(args, number, paths)
             state = update_state(

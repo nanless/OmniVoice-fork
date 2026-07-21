@@ -243,7 +243,8 @@ python batch_generate_text_and_clone/voice_clone/run_speaker_topup_loop.py \
   --generation-multiplier 4 \
   --history-reference-limit 8 \
   --gpus 0,1,2,3,4,5,6,7 \
-  --workers-per-gpu 2
+  --workers-per-gpu 2 \
+  --wait-for-gpus
 ```
 
 每轮严格执行：
@@ -259,6 +260,8 @@ accepted WAV 时长。planner 读取所有 prior plan，拒绝复用历史 `(ref
 aggregate 只用于优先选择曾产生高 raw-cosine 分数的原始 reference，不改变筛选阈值。
 有通过历史时每位 speaker 默认只保留表现最好的 8 条 reference；没有通过历史时回退到历史 raw
 cosine 最高的 8 条。这个上限只改变生成候选的效率，不改变 `SIM > 0.8` 与 `CER < 0.1`。
+`--wait-for-gpus` 默认要求所选 GPU 连续 3 次（间隔 30 秒）满足利用率不高于 10%、显存不高于
+1,024 MiB 才启动 clone，避免和服务器上的其他任务抢卡；阈值和连续次数均可显式调整。
 
 发布/清理可以单独预演。默认只生成不可变操作计划，不复制或删除：
 
