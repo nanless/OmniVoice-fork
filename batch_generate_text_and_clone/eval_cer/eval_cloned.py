@@ -20,7 +20,13 @@ sys.path.insert(0, str(PIPELINE_DIR))
 sys.path.insert(0, str(EVAL_DIR))
 
 import eval_batch_200 as eb  # noqa: E402
-from eval_common import CerAccumulator, list_clone_items, write_json  # noqa: E402
+from eval_common import (  # noqa: E402
+    CerAccumulator,
+    list_clone_items,
+    load_inventory_wav_list,
+    validate_sim_selection_manifest,
+    write_json,
+)
 
 CER_METRIC = eb.CER_METRIC
 CER_SCORE_VERSION = eb.CER_SCORE_VERSION
@@ -309,6 +315,7 @@ def write_canonical_reports(
     args,
     paths: dict,
     all_pairs: list[tuple[Path, Path]],
+    evaluation_scope: dict,
     batch_size: int,
     evaluated_at: str,
     processed_this_run: int,
@@ -321,6 +328,7 @@ def write_canonical_reports(
         "out_dir": str(args.out_dir),
         "items_processed_this_run": processed_this_run,
         "items_total_canonical": len(detailed),
+        **evaluation_scope,
         "batch_size": batch_size,
         "cer_metric": CER_METRIC,
         "cer_score_version": CER_SCORE_VERSION,
@@ -386,6 +394,22 @@ def main() -> None:
     parser.add_argument("--cache-flush-every", type=int, default=1000)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument(
+        "--wav-list",
+        type=Path,
+        help=(
+            "Evaluate exactly the absolute WAV paths in this allowlist. Each path "
+            "must belong to the current clone inventory under --out-dir."
+        ),
+    )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        help=(
+            "Directory for scoped CER aggregate reports. Required with --wav-list "
+            "so a subset run cannot overwrite full-inventory canonical reports."
+        ),
+    )
     parser.add_argument("--refresh-asr-cache", action="store_true")
     parser.add_argument(
         "--refresh-cer",
@@ -406,11 +430,69 @@ def main() -> None:
         parser.error("--skip-asr and --refresh-asr-cache are mutually exclusive")
     if args.skip_existing and (args.refresh_asr_cache or args.refresh_cer):
         parser.error("refresh options require the full inventory; remove --skip-existing")
+    if (args.wav_list is None) != (args.report_dir is None):
+        parser.error("--wav-list and --report-dir must be provided together")
 
-    all_pairs = list(find_all_cloned(args.out_dir, allow_partial=args.allow_partial))
-    if not all_pairs:
+    inventory_pairs = list(find_all_cloned(args.out_dir, allow_partial=args.allow_partial))
+    if not inventory_pairs:
         raise RuntimeError("No cloned audio found")
+    all_pairs = inventory_pairs
+    evaluation_scope = {
+        "evaluation_scope": "full_inventory",
+        "wav_list": None,
+        "wav_list_count": len(all_pairs),
+        "wav_list_fingerprint": None,
+    }
+    if args.wav_list is not None:
+        selected_paths, list_fingerprint = load_inventory_wav_list(
+            args.wav_list,
+            args.out_dir,
+            (wav for wav, _ in inventory_pairs),
+        )
+        pair_by_wav = {
+            str(wav.resolve(strict=True)): (wav, json_path)
+            for wav, json_path in inventory_pairs
+        }
+        all_pairs = [pair_by_wav[str(wav)] for wav in selected_paths]
+        selection_manifest = validate_sim_selection_manifest(
+            args.wav_list,
+            args.out_dir,
+            selected_paths,
+            list_fingerprint,
+            len(inventory_pairs),
+        )
+        evaluation_scope = {
+            "evaluation_scope": "wav_list",
+            "wav_list": str(args.wav_list.resolve(strict=True)),
+            "wav_list_count": len(all_pairs),
+            "wav_list_fingerprint": list_fingerprint,
+            "selection_manifest": str(
+                args.wav_list.resolve(strict=True).with_suffix(
+                    args.wav_list.suffix + ".manifest.json"
+                )
+            ),
+            "selection_threshold": selection_manifest[
+                "min_raw_cosine_similarity"
+            ],
+            "selection_operator": selection_manifest["similarity_operator"],
+        }
+        print(
+            f"WAV-list scope: {len(all_pairs)} current inventory audios "
+            f"({list_fingerprint})",
+            flush=True,
+        )
     paths = eb.eval_paths_full(args.out_dir)
+    if args.report_dir is not None:
+        report_dir = args.report_dir.resolve()
+        report_dir.mkdir(parents=True, exist_ok=True)
+        paths.update(
+            {
+                "summary": report_dir / "eval_summary.json",
+                "summary_progress": report_dir / "eval_summary_progress.json",
+                "details_jsonl": report_dir / "eval_cer_details.jsonl",
+                "details": report_dir / "eval_details.txt",
+            }
+        )
     evaluated_at = datetime.now().isoformat()
 
     pairs = list(all_pairs)
@@ -424,17 +506,26 @@ def main() -> None:
     if not pairs:
         count = rebuild_cer_details(all_pairs, paths["details_jsonl"])
         write_canonical_reports(
-            args, paths, all_pairs, batch_size, evaluated_at, processed_this_run=0
+            args,
+            paths,
+            all_pairs,
+            evaluation_scope,
+            batch_size,
+            evaluated_at,
+            processed_this_run=0,
         )
         print(f"All {count} audios already evaluated; rebuilt canonical outputs.")
         return
 
+    asr_results, asr_signatures = eb.load_valid_asr_cache(
+        paths["asr_cache"], paths["asr_cache_meta"], inventory_pairs
+    )
     if args.refresh_asr_cache:
-        asr_results, asr_signatures = {}, {}
+        refresh_keys = {str(wav) for wav, _ in all_pairs}
+        for key in refresh_keys:
+            asr_results.pop(key, None)
+            asr_signatures.pop(key, None)
     else:
-        asr_results, asr_signatures = eb.load_valid_asr_cache(
-            paths["asr_cache"], paths["asr_cache_meta"], all_pairs
-        )
         reused = _seed_asr_from_sidecars(all_pairs, asr_results, asr_signatures)
         if reused:
             print(f"Reused ASR text from {reused} current sidecars", flush=True)
@@ -494,6 +585,7 @@ def main() -> None:
                         "stage": "running",
                         "items_done": processed,
                         "items_total": len(pairs),
+                        **evaluation_scope,
                         "cer_metric": CER_METRIC,
                         "cer_score_version": CER_SCORE_VERSION,
                         "normalization_profile": eb.NORMALIZATION_PROFILE,
@@ -514,6 +606,7 @@ def main() -> None:
         args,
         paths,
         all_pairs,
+        evaluation_scope,
         batch_size,
         evaluated_at,
         processed_this_run=processed,

@@ -58,8 +58,14 @@ from cer_normalization import (  # noqa: E402
 from eval_contract import (  # noqa: E402
     asr_decode_fingerprint,
     asr_model_fingerprint,
+    file_signature,
 )
-from eval_common import iter_clone_records, write_json  # noqa: E402
+from eval_common import (  # noqa: E402
+    iter_clone_records,
+    load_inventory_wav_list,
+    wav_list_fingerprint,
+    write_json,
+)
 
 
 def load_cer_data(jsonl_path: Path) -> Dict[str, dict]:
@@ -137,6 +143,32 @@ def validate_cer_normalization_inputs(
             raise ValueError(
                 f"CER reference normalization input is stale for current clone metadata: {wav}"
             )
+
+
+def validate_scoped_cer_summary(
+    cer_path: Path,
+    candidate_count: int,
+    candidate_fingerprint: str,
+) -> None:
+    summary_path = cer_path.parent / "eval_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"Invalid or missing scoped CER summary: {summary_path}") from exc
+    expected = {
+        "stage": "complete",
+        "evaluation_scope": "wav_list",
+        "wav_list_count": candidate_count,
+        "wav_list_fingerprint": candidate_fingerprint,
+        "items_total_canonical": candidate_count,
+        "details_jsonl": str(cer_path.resolve(strict=True)),
+    }
+    mismatched = [key for key, value in expected.items() if summary.get(key) != value]
+    if mismatched:
+        raise ValueError(
+            f"Scoped CER summary does not match the candidate list: "
+            f"{', '.join(mismatched)}"
+        )
 
 
 def load_sim_data(details_path: Path) -> Dict[str, dict]:
@@ -234,11 +266,23 @@ def filter_and_save(
         tmp.unlink(missing_ok=True)
     write_json(output.with_suffix(output.suffix + ".manifest.json"), {
         **manifest_base,
+        "stage": "complete",
+        "selection_kind": (
+            "sim_threshold"
+            if max_cer is None and min_sim is not None
+            else "cer_sim_threshold"
+            if max_cer is not None and min_sim is not None
+            else "cer_threshold"
+        ),
         "output": str(output),
+        "output_signature": file_signature(output),
         "max_cer": max_cer,
+        "cer_operator": "<" if max_cer is not None else None,
         "min_raw_cosine_similarity": min_sim,
+        "similarity_operator": ">" if min_sim is not None else None,
         "inventory_count": len(inventory),
         "matched_count": len(matched),
+        "wav_list_fingerprint": wav_list_fingerprint(matched),
         "cer_missing_in_candidates": cer_miss,
         "sim_missing_in_candidates": sim_miss,
     })
@@ -260,6 +304,19 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory (auto-names files)")
     parser.add_argument("--sim-details", type=Path, default=None,
                         help="Explicit SIM JSONL (default: OUT/eval_sim_details.jsonl)")
+    parser.add_argument(
+        "--cer-details",
+        type=Path,
+        help="Explicit scoped CER JSONL (default: OUT/eval_cer_details.jsonl)",
+    )
+    parser.add_argument(
+        "--candidate-list",
+        type=Path,
+        help=(
+            "Restrict screening to this current-inventory WAV list and require "
+            "complete requested metric coverage for every listed candidate"
+        ),
+    )
     parser.add_argument("--allow-partial", action="store_true",
                         help="Allow missing metric coverage and invalid clone records")
     args = parser.parse_args()
@@ -289,7 +346,16 @@ def main():
     inventory = set(inventory_records)
     if not inventory:
         raise RuntimeError(f"No valid clone inventory found under {out_dir}")
-    cer_path = out_dir / "eval_cer_details.jsonl"
+    screening_inventory = inventory
+    candidate_fingerprint = None
+    if args.candidate_list is not None:
+        candidate_paths, candidate_fingerprint = load_inventory_wav_list(
+            args.candidate_list,
+            out_dir,
+            inventory,
+        )
+        screening_inventory = {str(path) for path in candidate_paths}
+    cer_path = args.cer_details or (out_dir / "eval_cer_details.jsonl")
 
     # For SIM data, look in out_dir
     sim_details = args.sim_details or (out_dir / "eval_sim_details.jsonl")
@@ -299,6 +365,12 @@ def main():
     if args.max_cer is not None:
         cer_data = load_cer_data(cer_path)
         validate_cer_normalization_inputs(cer_data, inventory_records)
+        if args.candidate_list is not None:
+            validate_scoped_cer_summary(
+                cer_path,
+                len(screening_inventory),
+                candidate_fingerprint,
+            )
 
     # Load SIM
     sim_data = {}
@@ -319,20 +391,32 @@ def main():
         requested_collections.append(("SIM", sim_data))
     for label, records in requested_collections:
         extra = set(records) - inventory
-        missing = inventory - set(records)
+        missing = screening_inventory - set(records)
         if extra:
             raise RuntimeError(f"{label} contains {len(extra)} records outside current clone inventory")
-        if missing and not args.allow_partial:
+        if label == "CER" and args.candidate_list is not None:
+            outside_scope = set(records) - screening_inventory
+            if outside_scope:
+                raise RuntimeError(
+                    f"CER contains {len(outside_scope)} records outside candidate scope"
+                )
+        if missing and (args.candidate_list is not None or not args.allow_partial):
             raise RuntimeError(
-                f"{label} coverage incomplete: {len(records)}/{len(inventory)}; "
-                "use --allow-partial only for intentional partial screening"
+                f"{label} coverage incomplete for screening scope: "
+                f"{len(screening_inventory) - len(missing)}/{len(screening_inventory)}"
             )
 
     manifest_base = {
-        "schema_version": 1,
+        "schema_version": 2,
         "out_dir": str(out_dir),
         "cer_details": str(cer_path) if args.max_cer is not None else None,
         "sim_details": str(sim_details) if args.min_sim is not None else None,
+        "sim_details_signature": (
+            file_signature(sim_details) if args.min_sim is not None else None
+        ),
+        "cer_details_signature": (
+            file_signature(cer_path) if args.max_cer is not None else None
+        ),
         "cer_metric": "deterministic_char_cer" if args.max_cer is not None else None,
         "cer_score_version": CER_SCORE_VERSION if args.max_cer is not None else None,
         "cer_normalization_version": NORMALIZATION_VERSION if args.max_cer is not None else None,
@@ -340,6 +424,13 @@ def main():
         "cer_asr_decode_fingerprint": asr_decode_fingerprint() if args.max_cer is not None else None,
         "similarity_metric": "raw_cosine" if args.min_sim is not None else None,
         "allow_partial": args.allow_partial,
+        "candidate_list": (
+            str(args.candidate_list.resolve(strict=True))
+            if args.candidate_list is not None
+            else None
+        ),
+        "candidate_count": len(screening_inventory),
+        "candidate_list_fingerprint": candidate_fingerprint,
         "cer_record_count": len(cer_data),
         "sim_record_count": len(sim_data),
         "cer_missing_from_inventory": len(inventory - set(cer_data)) if args.max_cer is not None else None,
@@ -379,7 +470,14 @@ def main():
         print(f"Filtering: {tag}", file=sys.stderr)
 
         matched, cer_miss, sim_miss = filter_and_save(
-            cer_data, sim_data, mc, ms, outpath, str(out_dir), inventory, manifest_base,
+            cer_data,
+            sim_data,
+            mc,
+            ms,
+            outpath,
+            str(out_dir),
+            screening_inventory,
+            manifest_base,
         )
 
         # Stats

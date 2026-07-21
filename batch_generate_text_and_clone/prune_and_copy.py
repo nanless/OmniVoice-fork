@@ -2,8 +2,8 @@
 """Delete bad cloned audios and copy good ones to target speaker directories.
 
 Rules (default raw cosine threshold: 0.80):
-  DELETE: CER >= 0.05  AND NOT (CER <= 0.1 AND raw cosine SIM > threshold)
-  COPY:   CER <= 0.1   AND raw cosine SIM > threshold
+  DELETE: CER >= 0.05  AND NOT (CER < 0.1 AND raw cosine SIM > threshold)
+  COPY:   CER < 0.1    AND raw cosine SIM > threshold
   KEEP:   everything else (stay in source, no action)
 
 Naming:
@@ -273,10 +273,10 @@ def classify(
 
     sim_pass = sim > sim_threshold
     cer_lt_005 = cer < 0.05
-    cer_le_01 = cer <= 0.1
+    cer_lt_01 = cer < 0.1
 
     # COPY: acceptable content and voice similarity above the configured threshold.
-    if cer_le_01 and sim_pass:
+    if cer_lt_01 and sim_pass:
         return "COPY"
 
     # DELETE: CER >= 0.05 unless already accepted by the COPY rule above.
@@ -604,8 +604,8 @@ def main():
             "copy_skipped_no_ref": no_ref_count,
             "min_raw_cosine_similarity": args.min_sim,
             "rules": (
-                f"DELETE: CER>=0.05 unless CER<=0.1 AND raw_SIM>{args.min_sim}; "
-                f"COPY: CER<=0.1 AND raw_SIM>{args.min_sim}"
+                f"DELETE: CER>=0.05 unless CER<0.1 AND raw_SIM>{args.min_sim}; "
+                f"COPY: CER<0.1 AND raw_SIM>{args.min_sim}"
             ),
         }
         args.log.write_text(json.dumps(log_entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

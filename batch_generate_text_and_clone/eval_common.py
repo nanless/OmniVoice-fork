@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -40,6 +41,108 @@ def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def wav_list_fingerprint(paths) -> str:
+    """Fingerprint an ordered sequence using the on-disk one-path-per-line form."""
+    payload = "".join(f"{path}\n" for path in paths).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_inventory_wav_list(
+    list_path: Path,
+    out_dir: Path,
+    inventory_paths,
+) -> tuple[list[Path], str]:
+    """Load an ordered WAV allowlist and bind it to the current inventory.
+
+    Every non-empty line must be an absolute path to a current inventory WAV
+    located below ``out_dir``.  Duplicate, missing, out-of-root, and stale
+    entries fail closed.  The returned fingerprint is over the canonical
+    ordered paths, so downstream reports can identify the exact evaluation
+    scope without trusting the mutable list file.
+    """
+    list_path = Path(list_path)
+    root = Path(out_dir).resolve(strict=True)
+    inventory = {}
+    for path in inventory_paths:
+        resolved = Path(path).resolve(strict=True)
+        inventory[str(resolved)] = resolved
+    selected: list[Path] = []
+    seen: set[str] = set()
+    with open(list_path, encoding="utf-8") as source:
+        for line_no, raw_line in enumerate(source, 1):
+            value = raw_line.strip()
+            if not value:
+                continue
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                raise ValueError(
+                    f"{list_path}:{line_no}: WAV path must be absolute: {value!r}"
+                )
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise ValueError(
+                    f"{list_path}:{line_no}: WAV is missing or outside out-dir: {value!r}"
+                ) from exc
+            key = str(resolved)
+            if key in seen:
+                raise ValueError(f"{list_path}:{line_no}: duplicate WAV path: {key}")
+            if key not in inventory:
+                raise ValueError(
+                    f"{list_path}:{line_no}: WAV is not in current clone inventory: {key}"
+                )
+            seen.add(key)
+            selected.append(inventory[key])
+    return selected, wav_list_fingerprint(selected)
+
+
+def validate_sim_selection_manifest(
+    list_path: Path,
+    out_dir: Path,
+    selected_paths,
+    fingerprint: str,
+    inventory_count: int,
+) -> dict:
+    """Validate the completed SIM-threshold manifest adjacent to a WAV list."""
+    list_path = Path(list_path).resolve(strict=True)
+    manifest_path = list_path.with_suffix(list_path.suffix + ".manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"Invalid or missing SIM selection manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"SIM selection manifest must be an object: {manifest_path}")
+    stat = list_path.stat()
+    expected = {
+        "schema_version": 2,
+        "stage": "complete",
+        "selection_kind": "sim_threshold",
+        "out_dir": str(Path(out_dir).resolve(strict=True)),
+        "output": str(list_path),
+        "output_signature": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+        "inventory_count": inventory_count,
+        "matched_count": len(selected_paths),
+        "wav_list_fingerprint": fingerprint,
+        "similarity_metric": "raw_cosine",
+        "similarity_operator": ">",
+    }
+    mismatched = [key for key, value in expected.items() if manifest.get(key) != value]
+    threshold = manifest.get("min_raw_cosine_similarity")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not 0.0 <= threshold <= 1.0
+    ):
+        mismatched.append("min_raw_cosine_similarity")
+    if mismatched:
+        raise ValueError(
+            f"Stale/invalid SIM selection manifest {manifest_path}; "
+            f"mismatched fields: {', '.join(sorted(set(mismatched)))}"
+        )
+    return manifest
 
 
 def parse_gpu_list(gpus: str | None = None, gpu: int | None = None) -> List[str]:

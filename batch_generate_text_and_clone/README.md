@@ -119,7 +119,7 @@ bash run_eval.sh
 
 → 详见 [eval_mos/README.md](eval_mos/README.md)
 
-### 全库三类评测（CER → SIM → MOS，tmux 后台）
+### 生产漏斗评测（SIM → 筛选 → CER → 筛选，tmux 后台）
 
 ```bash
 bash batch_generate_text_and_clone/run_eval_all.sh   # 自动创建 tmux session eval_all
@@ -127,8 +127,10 @@ tmux attach -t eval_all                              # 查看进度
 tail -f "$CLONED_VOICES_ROOT/logs/eval_all/cer.log"  # 或单独看某阶段日志
 ```
 
-默认顺序：**CER → SIM → MOS**；CER 与 SIM 默认串行并使用分离的 GPU 配置。`--skip-existing`
-只复用通过当前音频、模型和指标契约校验的 sidecar，canonical aggregate 会从 sidecar 原子重建。
+默认顺序：先对当前有效 clone inventory 跑 raw-cosine SIM，再生成严格
+`SIM > 0.8` 清单；CER 只评测该清单，最后生成严格 `CER < 0.1` 的联合通过清单。
+子集 CER aggregate 写入独立的 `eval_scopes/`，不会覆盖全库 CER aggregate；逐音频
+sidecar 和仍有效的全局 ASR cache 可以安全续用。MOS 是最后的可选独立阶段。
 
 ### ⑥ 严格筛选
 
@@ -139,8 +141,9 @@ python batch_generate_text_and_clone/filter_cloned.py \
   --output "$CLONED_VOICES_ROOT/filtered/cer_lt0.1_sim_gt0.8.txt"
 ```
 
-`--min-sim` 使用原始余弦相似度 `[-1, 1]`，默认阈值为 `0.8`。筛选默认要求 CER/SIM 对当前 clone inventory
-达到 100% 覆盖，并为结果列表写同名 `.manifest.json`；仅调试局部结果时才使用 `--allow-partial`。
+`--min-sim` 使用原始余弦相似度 `[-1, 1]`，默认阈值为 `0.8`。结果列表带同名
+`.manifest.json`。漏斗模式通过 `--candidate-list` 将 CER 完整覆盖域严格绑定为 SIM 通过集合，
+任何缺项都会失败，不会被集合交集静默忽略。
 
 需要按 CER/SIM 分类并复制到 accepted root 时，先运行 `prune_and_copy.py` 查看预览；只有复核统计后显式加
 `--execute` 才会删除 raw round 中的失败项并复制通过项。默认不再修改任何音频。

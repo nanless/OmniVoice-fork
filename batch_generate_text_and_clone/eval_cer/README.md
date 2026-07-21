@@ -56,6 +56,19 @@ python eval_cer/eval_cloned.py \
   --batch-size 16 --skip-existing
 ```
 
+生产漏斗中使用 SIM 筛选清单，并把子集汇总写入独立目录：
+
+```bash
+python eval_cer/eval_cloned.py \
+  --out-dir /path/to/raw_clone_round \
+  --wav-list /path/to/raw_clone_round/filtered/sim_gt0.8.txt \
+  --report-dir /path/to/raw_clone_round/eval_scopes/sim_gt0.8 \
+  --batch-size 16 --skip-existing
+```
+
+`--wav-list` 必须带由 `filter_cloned.py` 原子生成的完整 manifest；清单中的每个路径必须
+属于当前 clone inventory。子集运行只对清单做 ASR/CER，但保留清单外仍有效的全局 ASR cache。
+
 常用参数：
 
 - `--skip-asr`：只使用模型、decode 和 WAV 签名均有效的 ASR cache/sidecar hypothesis。

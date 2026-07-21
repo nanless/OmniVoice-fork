@@ -1,5 +1,5 @@
 #!/bin/bash
-# 全库评测：CER → SIM → MOS(多指标)，sidecar 写在音频旁，tmux 后台运行
+# 漏斗评测：SIM → SIM筛选 → CER(SIM通过项) → CER筛选 → 可选MOS
 #
 # Sidecar（与 text_001.wav 同目录）：
 #   text_001.eval.json  CER
@@ -11,7 +11,6 @@
 #   tmux attach -t eval_all                                       # 查看进度
 #
 #   IN_TMUX=1 bash batch_generate_text_and_clone/run_eval_all.sh  # 前台/已在 tmux 内
-#   PARALLEL_SIM=1  CER 与 SIM 并行（默认 0）；GPU 集合不得重叠
 #   SKIP_EXISTING=0  全量重算（默认 1 跳过已有 sidecar）
 
 set -euo pipefail
@@ -23,7 +22,13 @@ OUT_DIR="${CLONED_VOICES_ROOT:-/root/group-shared/voiceprint/data/speech/voice_a
 CER_GPU="${CER_GPU:-${GPU:-0}}"
 SIM_GPUS="${SIM_GPUS:-${GPUS:-1,2,3,4}}"
 MOS_GPUS="${MOS_GPUS:-$SIM_GPUS}"
-PARALLEL_SIM="${PARALLEL_SIM:-0}"
+SIM_THRESHOLD="${SIM_THRESHOLD:-0.8}"
+CER_THRESHOLD="${CER_THRESHOLD:-0.1}"
+FILTER_DIR="${FILTER_DIR:-$OUT_DIR/filtered}"
+SIM_PASS_LIST="${SIM_PASS_LIST:-$FILTER_DIR/sim_gt${SIM_THRESHOLD}.txt}"
+CER_SCOPE_DIR="${CER_SCOPE_DIR:-$OUT_DIR/eval_scopes/sim_gt${SIM_THRESHOLD}}"
+FINAL_PASS_LIST="${FINAL_PASS_LIST:-$FILTER_DIR/cer_lt${CER_THRESHOLD}_sim_gt${SIM_THRESHOLD}.txt}"
+EVAL_RUN_ID="${EVAL_RUN_ID:-$(date '+%Y%m%d_%H%M%S')}"
 
 if [[ "${IN_TMUX:-0}" != "1" ]]; then
   if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -31,10 +36,10 @@ if [[ "${IN_TMUX:-0}" != "1" ]]; then
     exit 1
   fi
   tmux new-session -d -s "$SESSION" \
-    "IN_TMUX=1 CLONED_VOICES_ROOT='$OUT_DIR' CER_GPU='$CER_GPU' SIM_GPUS='$SIM_GPUS' MOS_GPUS='$MOS_GPUS' SKIP_CER='${SKIP_CER:-0}' SKIP_SIM='${SKIP_SIM:-0}' SKIP_MOS='${SKIP_MOS:-0}' SKIP_EXISTING='${SKIP_EXISTING:-1}' SKIP_ASR='${SKIP_ASR:-0}' REFRESH_CER='${REFRESH_CER:-0}' REFRESH_ASR='${REFRESH_ASR:-0}' ALLOW_PARTIAL='${ALLOW_PARTIAL:-0}' ASR_BATCH_SIZE='${ASR_BATCH_SIZE:-16}' EVAL_WORKERS='${EVAL_WORKERS:-}' PYTHON='${PYTHON:-}' PYTHON_CER='${PYTHON_CER:-}' TTS_EVAL_MODEL_DIR='${TTS_EVAL_MODEL_DIR:-}' PARALLEL_SIM='$PARALLEL_SIM' exec bash '$SCRIPT'"
+    "IN_TMUX=1 CLONED_VOICES_ROOT='$OUT_DIR' CER_GPU='$CER_GPU' SIM_GPUS='$SIM_GPUS' MOS_GPUS='$MOS_GPUS' SKIP_CER='${SKIP_CER:-0}' SKIP_SIM='${SKIP_SIM:-0}' SKIP_MOS='${SKIP_MOS:-0}' SKIP_EXISTING='${SKIP_EXISTING:-1}' SKIP_ASR='${SKIP_ASR:-0}' REFRESH_CER='${REFRESH_CER:-0}' REFRESH_ASR='${REFRESH_ASR:-0}' ALLOW_PARTIAL='${ALLOW_PARTIAL:-0}' ASR_BATCH_SIZE='${ASR_BATCH_SIZE:-16}' EVAL_WORKERS='${EVAL_WORKERS:-}' PYTHON='${PYTHON:-}' PYTHON_CER='${PYTHON_CER:-}' TTS_EVAL_MODEL_DIR='${TTS_EVAL_MODEL_DIR:-}' SIM_THRESHOLD='$SIM_THRESHOLD' CER_THRESHOLD='$CER_THRESHOLD' FILTER_DIR='$FILTER_DIR' SIM_PASS_LIST='$SIM_PASS_LIST' CER_SCOPE_DIR='$CER_SCOPE_DIR' FINAL_PASS_LIST='$FINAL_PASS_LIST' EVAL_RUN_ID='$EVAL_RUN_ID' exec bash '$SCRIPT'"
   echo "Started tmux session: $SESSION"
   echo "  attach: tmux attach -t $SESSION"
-  echo "  logs:   tail -f $OUT_DIR/logs/eval_all/main.log"
+  echo "  logs:   tail -f $OUT_DIR/logs/eval_all/$EVAL_RUN_ID/main.log"
   exit 0
 fi
 
@@ -43,7 +48,7 @@ if [[ ! -d "$OUT_DIR" ]]; then
   exit 1
 fi
 
-LOG_DIR="$OUT_DIR/logs/eval_all"
+LOG_DIR="$OUT_DIR/logs/eval_all/$EVAL_RUN_ID"
 mkdir -p "$LOG_DIR"
 
 export PYTHONUNBUFFERED=1
@@ -92,34 +97,14 @@ ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-16}"
 IFS=',' read -r -a SIM_GPU_ARRAY <<< "$SIM_GPUS"
 EVAL_WORKERS="${EVAL_WORKERS:-${#SIM_GPU_ARRAY[@]}}"
 
-gpu_lists_overlap() {
-  local left="$1"
-  local right=",${2// /},"
-  local gpu_id
-  IFS=',' read -r -a left_ids <<< "$left"
-  for gpu_id in "${left_ids[@]}"; do
-    gpu_id="${gpu_id// /}"
-    if [[ -n "$gpu_id" && "$right" == *",$gpu_id,"* ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-if [[ "$PARALLEL_SIM" == "1" ]] \
-  && [[ "${SKIP_CER:-0}" != "1" ]] \
-  && [[ "${SKIP_SIM:-0}" != "1" ]] \
-  && gpu_lists_overlap "$CER_GPU" "$SIM_GPUS"; then
-  echo "ERROR: parallel CER/SIM GPU sets overlap: CER_GPU=$CER_GPU SIM_GPUS=$SIM_GPUS" >&2
-  exit 1
-fi
-
-log "======== Full eval: CER → SIM → MOS ========"
-log "OUT=$OUT_DIR CER_GPU=$CER_GPU SIM_GPUS=$SIM_GPUS MOS_GPUS=$MOS_GPUS ASR_BATCH=$ASR_BATCH_SIZE WORKERS=$EVAL_WORKERS PARALLEL_SIM=$PARALLEL_SIM SKIP_EXISTING=${SKIP_EXISTING:-1}"
+log "======== Funnel eval: SIM → SIM filter → CER → CER filter → optional MOS ========"
+log "OUT=$OUT_DIR CER_GPU=$CER_GPU SIM_GPUS=$SIM_GPUS MOS_GPUS=$MOS_GPUS ASR_BATCH=$ASR_BATCH_SIZE WORKERS=$EVAL_WORKERS SKIP_EXISTING=${SKIP_EXISTING:-1}"
+log "STRICT THRESHOLDS: raw cosine > $SIM_THRESHOLD; deterministic CER < $CER_THRESHOLD"
+log "SIM_PASS_LIST=$SIM_PASS_LIST CER_SCOPE_DIR=$CER_SCOPE_DIR FINAL_PASS_LIST=$FINAL_PASS_LIST"
 log "PYTHON=$PYTHON PYTHON_CER=$PYTHON_CER"
 log "Logs: $LOG_DIR"
 
-CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE")
+CER_ARGS=(--out-dir "$OUT_DIR" --batch-size "$ASR_BATCH_SIZE" --wav-list "$SIM_PASS_LIST" --report-dir "$CER_SCOPE_DIR")
 if [[ "${SKIP_EXISTING:-1}" == "1" ]] \
   && [[ "${REFRESH_CER:-0}" != "1" ]] \
   && [[ "${REFRESH_ASR:-0}" != "1" ]]; then
@@ -147,44 +132,45 @@ run_sim() {
   log "[SIM] END"
 }
 
-if [[ "${SKIP_CER:-0}" != "1" ]] && [[ "${SKIP_SIM:-0}" != "1" ]] && [[ "$PARALLEL_SIM" == "1" ]]; then
-  log "[1/3] START CER + SIM (parallel, disjoint GPUs)"
-  run_cer &
-  CER_PID=$!
-  run_sim &
-  SIM_PID=$!
-  CER_OK=0
-  SIM_OK=0
-  wait "$CER_PID" && CER_OK=1 || true
-  wait "$SIM_PID" && SIM_OK=1 || true
-  if [[ "$CER_OK" != "1" ]]; then
-    log "ERROR: CER failed (exit != 0)"
-    exit 1
-  fi
-  if [[ "$SIM_OK" != "1" ]]; then
-    log "ERROR: SIM failed (exit != 0)"
-    exit 1
-  fi
-  log "[1/3] END CER + SIM"
-elif [[ "${SKIP_CER:-0}" != "1" ]]; then
-  log "[1/3] START CER (eval_cer)"
-  run_cer
-  log "[1/3] END CER"
+if [[ "${SKIP_SIM:-0}" != "1" ]]; then
+  log "[1/5] START SIM (full current clone inventory)"
+  run_sim
+  log "[1/5] END SIM"
 fi
 
-if [[ "${SKIP_SIM:-0}" != "1" ]] && [[ "$PARALLEL_SIM" != "1" || "${SKIP_CER:-0}" == "1" ]]; then
-  log "[2/3] START SIM (eval_sim)"
-  run_sim
-  log "[2/3] END SIM"
+log "[2/5] START strict SIM filter (> $SIM_THRESHOLD)"
+FILTER_SIM_ARGS=(--out-dir "$OUT_DIR" --min-sim "$SIM_THRESHOLD" --output "$SIM_PASS_LIST")
+[[ "${ALLOW_PARTIAL:-0}" == "1" ]] && FILTER_SIM_ARGS+=(--allow-partial)
+run_py "$SIM_LOG" "$ROOT/batch_generate_text_and_clone/filter_cloned.py" "${FILTER_SIM_ARGS[@]}"
+log "[2/5] END strict SIM filter: $(wc -l < "$SIM_PASS_LIST") candidates"
+
+if [[ "${SKIP_CER:-0}" != "1" ]]; then
+  log "[3/5] START CER on SIM-pass candidates only"
+  run_cer
+  log "[3/5] END CER"
 fi
+
+log "[4/5] START strict joint filter (SIM > $SIM_THRESHOLD AND CER < $CER_THRESHOLD)"
+FILTER_FINAL_ARGS=(
+  --out-dir "$OUT_DIR"
+  --candidate-list "$SIM_PASS_LIST"
+  --cer-details "$CER_SCOPE_DIR/eval_cer_details.jsonl"
+  --max-cer "$CER_THRESHOLD"
+  --min-sim "$SIM_THRESHOLD"
+  --output "$FINAL_PASS_LIST"
+)
+[[ "${ALLOW_PARTIAL:-0}" == "1" ]] && FILTER_FINAL_ARGS+=(--allow-partial)
+run_py "$CER_LOG" "$ROOT/batch_generate_text_and_clone/filter_cloned.py" "${FILTER_FINAL_ARGS[@]}"
+log "[4/5] END strict joint filter: $(wc -l < "$FINAL_PASS_LIST") accepted"
 
 if [[ "${SKIP_MOS:-0}" != "1" ]]; then
-  log "[3/3] START MOS (eval_mos)"
+  log "[5/5] START MOS (independent full-inventory stage)"
   : > "$MOS_LOG"
   run_py "$MOS_LOG" "$ROOT/batch_generate_text_and_clone/eval_mos/eval_clone_mos.py" \
     "${MOS_COMMON[@]}" --model-dir "$MODEL_MOS" --gpus "$MOS_GPUS" --workers "$EVAL_WORKERS"
-  log "[3/3] END MOS"
+  log "[5/5] END MOS"
 fi
 
 log "======== ALL DONE ========"
-log "Sidecars: text_*.eval.json (CER) / text_*.sim.json (SIM) / text_*.mos.json (质量多指标)"
+log "Accepted list: $FINAL_PASS_LIST"
+log "Sidecars: text_*.sim.json (SIM) / text_*.eval.json (CER on SIM-pass only) / text_*.mos.json (optional MOS)"
