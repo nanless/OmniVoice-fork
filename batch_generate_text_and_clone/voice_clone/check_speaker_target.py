@@ -11,6 +11,7 @@ from pathlib import Path
 from speaker_topup_common import (
     fraction_record,
     inventory_accepted,
+    inventory_strict_accepted,
     inventory_generated,
     inventory_original,
     iter_wavs,
@@ -28,8 +29,15 @@ def parse_args() -> argparse.Namespace:
         help="Quality-accepted clone root in <dataset>/<speaker>/ layout; repeatable",
     )
     parser.add_argument(
+        "--strict-accepted-root", type=Path, action="append", default=[],
+        help="Transactional top-up root; only fully committed rounds are counted",
+    )
+    parser.add_argument(
         "--generated-root", type=Path, action="append", default=[],
-        help="Optional raw plan output root; counts only generated schema-v3 sidecars",
+        help=(
+            "Optional raw plan output root for diagnostics only; generated audio "
+            "never contributes to the accepted-duration target"
+        ),
     )
     parser.add_argument("--target-seconds", type=Fraction, default=Fraction(1800))
     parser.add_argument("--output-jsonl", type=Path)
@@ -56,6 +64,13 @@ def main() -> int:
         [path.resolve() for path in args.accepted_root], target_paths, seen,
         args.scan_workers,
     )
+    strict, strict_counts, seen = inventory_strict_accepted(
+        [path.resolve() for path in args.strict_accepted_root], target_paths, seen,
+        args.scan_workers,
+    )
+    for speaker_key in target_paths:
+        accepted[speaker_key] += strict[speaker_key]
+        accepted_counts[speaker_key] += strict_counts[speaker_key]
     generated, generated_counts, _ = inventory_generated(
         [path.resolve() for path in args.generated_root], target_paths, seen,
         args.scan_workers,
@@ -63,7 +78,7 @@ def main() -> int:
 
     rows = []
     for speaker_key in sorted(target_paths):
-        total = original[speaker_key] + accepted[speaker_key] + generated[speaker_key]
+        total = original[speaker_key] + accepted[speaker_key]
         deficit = max(Fraction(0), args.target_seconds - total)
         rows.append({
             "record_type": "speaker_target_status",
@@ -71,12 +86,12 @@ def main() -> int:
             "target_duration": fraction_record(args.target_seconds),
             "original_duration": fraction_record(original[speaker_key]),
             "accepted_duration": fraction_record(accepted[speaker_key]),
-            "generated_duration": fraction_record(generated[speaker_key]),
+            "diagnostic_generated_duration": fraction_record(generated[speaker_key]),
             "total_duration": fraction_record(total),
             "deficit_duration": fraction_record(deficit),
             "original_file_count": original_counts[speaker_key],
             "accepted_file_count": accepted_counts[speaker_key],
-            "generated_file_count": generated_counts[speaker_key],
+            "diagnostic_generated_file_count": generated_counts[speaker_key],
             "meets_target": deficit == 0,
         })
 
@@ -84,9 +99,13 @@ def main() -> int:
     summary = {
         "record_type": "speaker_target_summary",
         "schema_version": 1,
+        "counting_policy": "original_plus_accepted_only",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "original_root": str(original_root),
         "accepted_roots": [str(path.resolve()) for path in args.accepted_root],
+        "strict_accepted_roots": [
+            str(path.resolve()) for path in args.strict_accepted_root
+        ],
         "generated_roots": [str(path.resolve()) for path in args.generated_root],
         "target_duration": fraction_record(args.target_seconds),
         "scan_workers": args.scan_workers,

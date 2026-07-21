@@ -47,6 +47,11 @@ def duration_fraction(path: Path) -> Fraction:
     return Fraction(frames, samplerate)
 
 
+def file_signature(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def parallel_durations(paths: Iterable[Path], scan_workers: int = 16) -> list[Fraction]:
     """Read WAV durations with bounded concurrency and stable result order."""
     if scan_workers <= 0:
@@ -156,6 +161,115 @@ def inventory_accepted(
             seen.add(real)
             jobs.append((key, wav))
             counts[key] += 1
+    for (key, _), duration in zip(jobs, parallel_durations(
+        (wav for _, wav in jobs), scan_workers
+    )):
+        durations[key] += duration
+    return durations, counts, seen
+
+
+def inventory_strict_accepted(
+    roots: Iterable[Path],
+    target_speakers: dict[str, Path],
+    seen_audio: set[Path] | None = None,
+    scan_workers: int = 16,
+) -> tuple[dict[str, Fraction], dict[str, int], set[Path]]:
+    """Inventory only committed top-up accepted WAVs with valid provenance."""
+    durations = {key: Fraction(0) for key in target_speakers}
+    counts = {key: 0 for key in target_speakers}
+    seen = seen_audio if seen_audio is not None else set()
+    identities: set[tuple[str, str]] = set()
+    jobs: list[tuple[str, Path]] = []
+    for root in roots:
+        root = root.resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Strict accepted root not found: {root}")
+        commit_cache: dict[str, dict[str, Any]] = {}
+        commits_dir = root / "commits"
+        if commits_dir.is_dir():
+            for commit_path in sorted(commits_dir.glob("*.accepted.json")):
+                try:
+                    commit = json.loads(commit_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, TypeError) as exc:
+                    raise ValueError(f"Invalid accepted round commit: {commit_path}") from exc
+                round_id = commit_path.name.removesuffix(".accepted.json")
+                if (
+                    commit.get("schema_version") != 1
+                    or commit.get("stage") != "accepted_committed"
+                    or commit.get("round_id") != round_id
+                    or commit.get("accepted_root") != str(root)
+                    or not isinstance(commit.get("accepted_count"), int)
+                    or commit["accepted_count"] < 0
+                    or commit.get("accepted_committed") != commit["accepted_count"]
+                    or not isinstance(commit.get("plan_id"), str)
+                    or not commit["plan_id"]
+                    or not isinstance(commit.get("accepted_list_fingerprint"), str)
+                    or not commit["accepted_list_fingerprint"]
+                ):
+                    raise ValueError(f"Stale accepted round commit: {commit_path}")
+                if round_id in commit_cache:
+                    raise ValueError(f"Duplicate accepted round commit: {round_id}")
+                commit_cache[round_id] = commit
+        round_counts = {round_id: 0 for round_id in commit_cache}
+        for wav in iter_wavs(root):
+            rel = wav.relative_to(root)
+            if len(rel.parts) < 4:
+                raise ValueError(
+                    f"Strict accepted audio must be under "
+                    f"<dataset>/<speaker>/<round_id>/: {wav}"
+                )
+            key = f"{rel.parts[0]}/{rel.parts[1]}"
+            round_id = rel.parts[2]
+            if key not in target_speakers:
+                raise ValueError(f"Strict accepted audio has unknown speaker {key}: {wav}")
+            # A crash can leave atomically-copied WAVs before the round commit.
+            # They are deliberately invisible to target accounting until resume.
+            if round_id not in commit_cache:
+                continue
+            acceptance_path = wav.with_suffix(".accepted.json")
+            try:
+                acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(f"Invalid strict acceptance sidecar: {acceptance_path}") from exc
+            if (
+                acceptance.get("schema_version") != 1
+                or acceptance.get("status") != "accepted"
+                or acceptance.get("speaker_key") != key
+                or acceptance.get("round_id") != round_id
+                or acceptance.get("accepted_wav") != str(wav)
+                or acceptance.get("accepted_signature") != file_signature(wav)
+            ):
+                raise ValueError(f"Stale strict acceptance sidecar: {acceptance_path}")
+            plan_id = acceptance.get("plan_id")
+            task_id = acceptance.get("task_id")
+            if not all(isinstance(value, str) and value for value in (plan_id, task_id)):
+                raise ValueError(f"Missing strict acceptance identity: {acceptance_path}")
+            identity = (plan_id, task_id)
+            if identity in identities:
+                raise ValueError(f"Duplicate strict accepted task identity: {identity}")
+            identities.add(identity)
+            commit = commit_cache[round_id]
+            if (
+                acceptance.get("selection_fingerprint")
+                != commit.get("accepted_list_fingerprint")
+                or acceptance.get("plan_id") != commit.get("plan_id")
+            ):
+                raise ValueError(
+                    f"Acceptance sidecar is not bound to round commit: {acceptance_path}"
+                )
+            real = wav.resolve()
+            if real in seen:
+                raise ValueError(f"Audio counted by more than one inventory root: {real}")
+            seen.add(real)
+            counts[key] += 1
+            round_counts[round_id] += 1
+            jobs.append((key, wav))
+        for round_id, commit in commit_cache.items():
+            if round_counts[round_id] != commit["accepted_count"]:
+                raise ValueError(
+                    f"Committed accepted count mismatch for {round_id}: "
+                    f"expected {commit['accepted_count']}, found {round_counts[round_id]}"
+                )
     for (key, _), duration in zip(jobs, parallel_durations(
         (wav for _, wav in jobs), scan_workers
     )):

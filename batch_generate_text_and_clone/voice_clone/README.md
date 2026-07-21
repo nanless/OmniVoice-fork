@@ -219,13 +219,58 @@ CLONED_VOICES_ROOT="$BASE/omnivoice_topup/round_001_raw" \
 bash batch_generate_text_and_clone/voice_clone/run_clone_8workers.sh
 ```
 
-随后对 `round_001_raw` 跑 CER/SIM/MOS，按 raw cosine `> 0.8` 和所需 CER/MOS 门槛复制到 accepted root，再检查：
+随后对 `round_001_raw` 先跑 raw-cosine SIM，按 `SIM > 0.8` 限定 CER 域，再按
+`CER < 0.1` 复制到 accepted root，最后检查：
 
 ```bash
 python batch_generate_text_and_clone/voice_clone/check_speaker_target.py \
   --original-root "$BASE/audio" \
   --accepted-root "$BASE/audio_omnivoice_clone_sim0.8_filtered" \
+  --strict-accepted-root "$BASE/audio_omnivoice_topup_sim0.8_cer0.1_accepted" \
   --target-seconds 1800
 ```
 
 checker 全部达标返回 0；仍有 speaker 缺口返回 1。此时用更新后的 accepted root 生成下一轮 plan。plan/task ID、speaker 分片、文件锁和 schema v3 sidecar 保证断点续跑及多 worker 幂等。
+
+### 自动多轮漏斗
+
+生产闭环使用独立的 top-up accepted root；旧 accepted root 保持不变。累计达标口径始终是
+`原音频 + legacy accepted + 已提交 top-up accepted`，raw clone 即使生成成功也不参与 30 分钟判断。
+
+```bash
+python batch_generate_text_and_clone/voice_clone/run_speaker_topup_loop.py \
+  --start-round 2 \
+  --generation-multiplier 4 \
+  --history-reference-limit 8 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --workers-per-gpu 2
+```
+
+每轮严格执行：
+
+```text
+plan → clone → raw cosine SIM → SIM > 0.8
+     → scoped CER → CER < 0.1
+     → publish accepted → delete rejected WAV → accepted-only target check
+```
+
+`generation-multiplier` 只放大本轮 raw 生成预算，不改变 1,800 秒接受目标。下一轮会重新读取实际
+accepted WAV 时长。planner 读取所有 prior plan，拒绝复用历史 `(ref_audio, text_id)`；历史 SIM
+aggregate 只用于优先选择曾产生高 raw-cosine 分数的原始 reference，不改变筛选阈值。
+有通过历史时每位 speaker 默认只保留表现最好的 8 条 reference；没有通过历史时回退到历史 raw
+cosine 最高的 8 条。这个上限只改变生成候选的效率，不改变 `SIM > 0.8` 与 `CER < 0.1`。
+
+发布/清理可以单独预演。默认只生成不可变操作计划，不复制或删除：
+
+```bash
+python batch_generate_text_and_clone/voice_clone/promote_and_prune_round.py \
+  --round-root "$BASE/omnivoice_topup/round_001_raw" \
+  --accepted-root "$BASE/audio_omnivoice_topup_sim0.8_cer0.1_accepted" \
+  --sim-pass-list "$BASE/omnivoice_topup/round_001_raw/filtered/sim_gt0.8.txt" \
+  --accepted-list "$BASE/omnivoice_topup/round_001_raw/filtered/cer_lt0.1_sim_gt0.8.txt"
+```
+
+复核操作计划后加 `--execute`。工具先幂等复制全部通过项，再同时写 raw round commit 和
+`accepted_root/commits/<round_id>.accepted.json`；只有带有效整轮 commit 的 top-up WAV 才计入
+30 分钟。未提交的中断副本会被忽略，重跑发布即可恢复。commit 落盘后才删除未通过 WAV 和指标
+sidecar；主 clone JSON 会保留并改为 `status=rejected`，用于审计和跨轮恢复。
